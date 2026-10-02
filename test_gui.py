@@ -534,6 +534,96 @@ def test_every_button(app):
         work.rmdir()
 
 
+def test_categories(app):
+    """Strength tiers, region filter and the category badges."""
+    print("\nstrength / region / category filters")
+    import geodb
+    real = geodb.lookup
+    geo = {"8.8.8.8": ("US", "United States"),
+           "9.9.9.9": ("DE", "Germany"),
+           "1.1.1.1": ("AU", "Australia")}
+    geodb.lookup = lambda h: geo.get(h, ("", ""))
+    try:
+        app.engine.set_proxies(["8.8.8.8:8080", "9.9.9.9:8080",
+                                "1.1.1.1:8080"])
+        pump(app, ticks=8)
+        by_label = {n.label: n for n in app.engine._nodes}
+        strong = by_label["9.9.9.9:8080"]
+        strong.status, strong.latency = "alive", 120.0
+        strong.sample(1.0)
+        strong.sample(1.0)
+        weak = by_label["8.8.8.8:8080"]
+        weak.status, weak.latency = "alive", 900.0
+        weak.sample(0.0)
+        weak.sample(0.0)
+        weak.sample(0.0)
+        # 1.1.1.1 stays unverified on purpose
+        app._render_pool(force=True)
+
+        def rows():
+            return list(app.tree.get_children())
+
+        badges = {iid: app.tree.item(iid, "values")[3]
+                  for iid in rows()}
+        check("status cell carries the strength badge",
+              badges.get("9.9.9.9:8080") == "Alive · Strong",
+              str(badges))
+        check("unverified badge for fresh nodes",
+              badges.get("1.1.1.1:8080") == "Unverified", str(badges))
+
+        app._status_var.set("Strong")
+        app._render_pool(force=True)
+        check("Strong filter",
+              rows() == ["9.9.9.9:8080"], str(rows()))
+        app._status_var.set("Fast")
+        app._render_pool(force=True)
+        check("Fast filter (<=300 ms)", rows() == ["9.9.9.9:8080"],
+              str(rows()))
+        app._status_var.set("All")
+        app._render_pool(force=True)
+
+        check("region choices built from the pool",
+              "Europe" in app._region_choices
+              and "North America" in app._region_choices
+              and "Oceania" in app._region_choices,
+              str(app._region_choices))
+        app._region_var.set("Europe")
+        app._render_pool(force=True)
+        check("region filter narrows the table",
+              rows() == ["9.9.9.9:8080"], str(rows()))
+        app._region_var.set("All regions")
+        app._render_pool(force=True)
+
+        app._filter_var.set("strong")
+        app._render_pool(force=True)
+        check("text filter matches the strength word",
+              rows() == ["9.9.9.9:8080"], str(rows()))
+        app._filter_var.set("oceania")
+        app._render_pool(force=True)
+        check("text filter matches the region word",
+              rows() == ["1.1.1.1:8080"], str(rows()))
+        app._filter_var.set("")
+        app._render_pool(force=True)
+
+        tally = app.pool_count.cget("text")
+        check("tally shows the strong count", "strong" in tally, tally)
+
+        app.tree.selection_set("9.9.9.9:8080")
+        app._on_select()
+        detail = app.detail.cget("text")
+        check("detail line carries strength and region",
+              "strength: Strong" in detail and "region: Europe" in detail,
+              detail[:90])
+    finally:
+        geodb.lookup = real
+        app._status_var.set("All")
+        app._region_var.set("All regions")
+        app._filter_var.set("")
+        app._sort = ("status", False)
+        app.engine.set_proxies([f"10.0.0.{i}:8080" for i in range(1, 41)])
+        app._render_pool(force=True)
+
+
 def test_engine_via_gui(app, target_port, mock_port):
     print("\nlifecycle driven from the UI")
     app.engine.set_proxies([f"127.0.0.1:{mock_port}"])
@@ -700,6 +790,7 @@ def main():
         test_pool_render(app)
         test_country(app)
         test_https_toggle(app)
+        test_categories(app)
         test_log(app)
         test_dialogs(app)
         test_every_button(app)

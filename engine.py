@@ -19,6 +19,19 @@ Fixes over the original snippet (behaviour otherwise unchanged):
   * The accept loop survives a bad request line; sockets are tracked and
     closed on shutdown; bytes transferred are counted.
 
+Anti-blocking behaviour (what makes blocked sites reachable):
+  * DNS for hostnames happens at the exit (SOCKS4a / SOCKS5 domain
+    addressing), so the lookup agrees with the proxy's location instead of
+    leaking the local resolver.
+  * Hop-by-hop headers never cross the proxy (Connection tokens,
+    Proxy-*, Expect), while every end-to-end header is forwarded verbatim.
+  * When the target itself answers 403/429/999 to a bodiless request, the
+    exit's IP is probably on a blocklist: the engine rotates onto another
+    upstream and retries, and only hands the block through when no
+    candidate is left (configurable via `rotate_on`).
+  * Each upstream carries a rolling success score (Strong / Good / Weak /
+    New); rotation offers the strong ones first.
+
 Thread model: the engine is driven by background threads and reports back
 through a log callback. The callback may be called from any thread -- a GUI
 caller must marshal it onto its own event loop (the Tkinter GUI does this
@@ -55,6 +68,7 @@ DEFAULTS = {
     "probe_connect": True,     # also test HTTPS (CONNECT) tunnel support
     "country": "",             # exit country (ISO 3166-1 alpha-2), "" = any
     "https_only": False,       # only use upstreams that can tunnel HTTPS
+    "rotate_on": "403,429,999",  # origin statuses that rotate onto another exit
 }
 
 MAX_HEADER_BYTES = 65536
@@ -148,6 +162,39 @@ def _guess_proto(fields) -> str:
 
 
 _CC_RE = re.compile(r"^[A-Za-z]{2}$")
+
+
+# ---------------------------------------------------------------------------
+# regions: coarse buckets over ISO country codes, for filtering the pool by
+# world area without a second GeoIP database
+# ---------------------------------------------------------------------------
+_REGION_GROUPS = {
+    "Europe": ("AD AL AT AX BA BE BG BY CH CY CZ DE DK EE ES FI FO FR GB GG GI "
+               "GR HR HU IE IM IS IT JE LI LT LU LV MC MD ME MK MT NL NO PL PT "
+               "RO RS RU SE SI SJ SK SM UA VA XK"),
+    "Asia": ("AE AF AM AZ BD BH BN BT CN GE HK ID IL IN IQ IR JO JP KG KH KP "
+             "KR KW KZ LA LB LK MM MN MO MV MY NP OM PH PK PS QA SA SG SY TH "
+             "TJ TL TM TR TW UZ VN YE"),
+    "Africa": ("AO BF BI BJ BW CD CF CG CI CM CV DJ EG EH ER ET GA GH GM GN "
+               "GQ GW KE KM LR LS LY MA MG ML MR MU MW MZ NA NE NG RE RW SC "
+               "SD SH SL SN SO SS ST SZ TD TG TN UG YT ZA ZM ZW"),
+    "North America": ("AG AI AW BB BL BM BQ BS BZ CA CR CU CW DM DO GD GL GP "
+                      "GT HN HT JM KN KY LC MF MQ MS MX NI PA PR SV SX TC TT "
+                      "VC VG VI US"),
+    "South America": ("AR BO BR CL CO EC FK GF GY PE PY SR UY VE"),
+    "Oceania": ("AU CC CX FJ FM GU HM KI MH MP NC NF NR NU NZ PF PG PN PW SB "
+                "TK TO TV VU WF WS"),
+}
+
+REGION_OF: dict[str, str] = {
+    cc: region for region, codes in _REGION_GROUPS.items()
+    for cc in codes.split()
+}
+
+
+def region_of(cc: str) -> str:
+    """"Europe" / "Asia" / … for an ISO country code, "" when unknown."""
+    return REGION_OF.get(str(cc or "").strip().upper(), "")
 
 
 def _guess_cc(fields) -> str:
@@ -290,6 +337,63 @@ def _is_upstream_rejection(status_line: bytes) -> bool:
     return parts[1] in UPSTREAM_REJECTIONS
 
 
+def _status_code(status_line: bytes) -> int:
+    """Numeric status code from a status line, -1 when unparseable."""
+    parts = status_line.split(b" ", 2)
+    if len(parts) >= 2 and parts[1][:1].isdigit():
+        try:
+            return int(parts[1][:3])
+        except ValueError:
+            return -1
+    return -1
+
+
+def _rotate_codes(raw) -> frozenset:
+    """Parse the `rotate_on` setting ("403,429,999") into a set of codes.
+
+    Tolerant by design: junk tokens are skipped so a hand-edited state
+    file can never crash a request, and an empty result simply means
+    "never rotate because of the target's answer".
+    """
+    out = set()
+    for tok in str(raw or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit() and 100 <= int(tok) <= 999:
+            out.add(int(tok))
+    return frozenset(out)
+
+
+def _validate_rotate_on(value) -> str:
+    """Normalise `rotate_on` or raise ValueError (used by configure())."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for tok in text.replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok and (not tok.isdigit() or not 100 <= int(tok) <= 999):
+            raise ValueError(
+                f"rotate_on must be comma-separated status codes "
+                f"(e.g. 403,429), got {value!r}")
+    return ",".join(tok.strip() for tok in text.replace(";", ",").split(",")
+                    if tok.strip())
+
+
+# Strength tiers: an exponentially weighted success score per upstream, so
+# the panel can show Strong / Good / Weak instead of just alive / dead.
+SCORE_ALPHA = 0.35           # EMA weight of the newest sample
+TIER_ORDER = {"Strong": 0, "Good": 1, "New": 2, "Weak": 3}
+
+
+def _tier(score, samples: int) -> str:
+    if samples <= 0 or score is None:
+        return "New"
+    if score >= 0.9 and samples >= 2:
+        return "Strong"
+    if score >= 0.65:
+        return "Good"
+    return "Weak"
+
+
 def _read_header_block(sock: socket.socket, limit: int = 65536) -> tuple[bytes, bytes]:
     """Read up to and including CRLFCRLF. Returns (header_block, remainder)."""
     buf = b""
@@ -344,14 +448,20 @@ def _idna(host: str) -> bytes:
 
 
 def _socks4_handshake(sock: socket.socket, host: str, port: int) -> None:
-    """SOCKS4 CONNECT (with a SOCKS4a fallback when local DNS fails)."""
-    ip = _as_ipv4(host) or _resolve_ipv4(host)
+    """SOCKS4 CONNECT, speaking SOCKS4a for hostnames.
+
+    Hostnames are handed to the upstream *as-is* instead of being resolved
+    locally: the DNS lookup then happens at the exit, so the target sees a
+    name/IP pair that agrees with the proxy's own location -- a local
+    lookup would leak the real resolver and break geo checks.
+    """
+    ip = _as_ipv4(host)
     if ip is not None:
         payload = socket.inet_aton(ip) + b"\x00"          # empty userid
     else:
         # SOCKS4a: hand the proxy a hostname and let it do the lookup
         payload = (b"\x00\x00\x00\x01"                    # 0.0.0.1 == 4a marker
-                   + b"\x00" + b"\x00"                    # empty userid
+                   + b"\x00"                              # empty userid
                    + _idna(host) + b"\x00")
     sock.sendall(struct.pack("!BBH", 4, 1, port) + payload)
     reply = _recv_exact(sock, 8)
@@ -404,8 +514,8 @@ def _socks5_handshake(sock: socket.socket, host: str, port: int) -> None:
         raise OSError(f"bad SOCKS5 address type {head[3]}")
 
 
-def _socks_dial(proto: str, address: tuple[str, int], host: str, port: int,
-                timeout: float) -> socket.socket:
+def _socks_dial_once(proto: str, address: tuple[str, int], host: str,
+                     port: int, timeout: float) -> socket.socket:
     """Open a raw TCP channel to (host, port) through a SOCKS upstream."""
     sock = socket.create_connection(address, timeout=timeout)
     sock.settimeout(timeout)
@@ -421,14 +531,44 @@ def _socks_dial(proto: str, address: tuple[str, int], host: str, port: int,
     return sock
 
 
+def _socks_dial(proto: str, address: tuple[str, int], host: str, port: int,
+                timeout: float) -> socket.socket:
+    """Dial through a SOCKS upstream; hostnames use remote DNS first.
+
+    SOCKS4a/SOCKS5 pass the hostname to the exit so DNS agrees with the
+    exit's location. Ancient SOCKS4 servers that reject the 4a marker get
+    one retry with a locally resolved address -- only ever on the failure
+    path, so the common case still never touches local DNS.
+    """
+    try:
+        return _socks_dial_once(proto, address, host, port, timeout)
+    except OSError:
+        if proto != "socks4" or _as_ipv4(host):
+            raise
+        ip = _resolve_ipv4(host)
+        if not ip:
+            raise
+        return _socks_dial_once(proto, address, ip, port, timeout)
+
+
 # ---------------------------------------------------------------------------
 # one upstream proxy
 # ---------------------------------------------------------------------------
+# Browser-shaped probe headers: plenty of public proxies refuse requests
+# that look like a script (no User-Agent), which used to mark healthy
+# nodes as dead and shrink the pool for no reason.
+_PROBE_UA = (b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+             b"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 "
+             b"Safari/537.36\r\n"
+             b"Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n")
+
+
 class Node:
     """A configured upstream plus its latest observed health."""
 
     __slots__ = ("host", "port", "proto", "cc", "country", "status", "latency",
-                 "last_check", "last_error", "failures", "hits", "connect_ok")
+                 "last_check", "last_error", "failures", "hits", "connect_ok",
+                 "score", "samples", "blocks")
 
     def __init__(self, host: str, port: int, proto: str = "http",
                  cc: str = "", country: str = ""):
@@ -444,6 +584,9 @@ class Node:
         self.failures = 0            # consecutive failures
         self.hits = 0                # connections successfully served
         self.connect_ok: bool | None = None   # HTTPS tunnel support
+        self.score: float | None = None       # EMA of recent success (0..1)
+        self.samples = 0             # observations behind `score`
+        self.blocks = 0              # times a target refused this exit's IP
 
     @property
     def label(self) -> str:
@@ -462,12 +605,33 @@ class Node:
         return self.cc or "—"
 
     @property
+    def region(self) -> str:
+        """Coarse world area ("Europe", "Asia", …) derived from the code."""
+        return region_of(self.cc)
+
+    @property
+    def strength(self) -> str:
+        """Strong / Good / Weak / New, from the rolling success score."""
+        return _tier(self.score, self.samples)
+
+    @property
     def https(self) -> str:
         return "yes" if self.connect_ok else ("no" if self.connect_ok is False else "—")
 
     @property
     def address(self) -> tuple[str, int]:
         return (self.host, self.port)
+
+    def sample(self, value: float) -> None:
+        """Fold one observation (1.0 success, 0.0 failure) into the score.
+
+        An exponential moving average reacts to the last few outcomes
+        instead of lifetime totals, so one bad sweep can demote a node and
+        a couple of clean ones can earn it back.
+        """
+        self.samples += 1
+        self.score = (value if self.score is None
+                      else (1 - SCORE_ALPHA) * self.score + SCORE_ALPHA * value)
 
     def as_dict(self) -> dict:
         return {
@@ -479,6 +643,7 @@ class Node:
             "cc": self.cc,
             "country": self.country,
             "country_label": self.country_label,
+            "region": self.region,
             "status": self.status,
             "latency": self.latency,
             "last_check": self.last_check,
@@ -487,6 +652,10 @@ class Node:
             "hits": self.hits,
             "connect_ok": self.connect_ok,
             "https": self.https,
+            "score": self.score,
+            "samples": self.samples,
+            "strength": self.strength,
+            "blocks": self.blocks,
         }
 
 
@@ -507,6 +676,13 @@ class RotatingProxy:
             code = ""
         self.settings["country"] = code
         self.settings["https_only"] = bool(self.settings.get("https_only"))
+        # a hand-edited state file must never break start-up: anything that
+        # is not a status-code list falls back to the shipped default
+        try:
+            self.settings["rotate_on"] = _validate_rotate_on(
+                self.settings.get("rotate_on"))
+        except ValueError:
+            self.settings["rotate_on"] = DEFAULTS["rotate_on"]
 
         self._log_cb = logger
         self._lock = threading.RLock()
@@ -560,8 +736,18 @@ class RotatingProxy:
         unknown = set(updates) - set(self.settings)
         if unknown:
             raise ValueError(f"unknown settings: {sorted(unknown)}")
+        if "rotate_on" in updates:
+            # normalised here so bad input surfaces as a dialog, not as
+            # silently disabled rotation later on
+            updates = dict(updates)
+            updates["rotate_on"] = _validate_rotate_on(updates["rotate_on"])
         self.settings.update(updates)
         return dict(self.settings)
+
+    @property
+    def rotate_codes(self) -> frozenset:
+        """Status codes that make a plain-HTTP request try another exit."""
+        return _rotate_codes(self.settings.get("rotate_on"))
 
     @property
     def country(self) -> str:
@@ -680,6 +866,8 @@ class RotatingProxy:
                     n.last_check, n.failures = prev.last_check, prev.failures
                     n.last_error, n.hits = prev.last_error, prev.hits
                     n.connect_ok = prev.connect_ok
+                    n.score, n.samples = prev.score, prev.samples
+                    n.blocks = prev.blocks
             self._nodes = nodes
         if bad:
             self.log("warn", f"ignored {len(bad)} malformed entr"
@@ -837,10 +1025,13 @@ class RotatingProxy:
     def _candidates(self, *, connect: bool = False) -> list[Node]:
         """Pick the upstreams to try for this request, best odds first.
 
-        For CONNECT we shuffle known HTTPS-capable nodes to the front: only
-        about a quarter of free proxies will tunnel, and without this a
-        single HTTPS request could burn all its retries on proxies that
-        answer 407 to CONNECT.
+        Ordering runs strongest-first: nodes whose recent success score
+        puts them in the Strong tier are offered before Good, New and
+        Weak ones (shuffled inside each tier so load still spreads over
+        the pool). For CONNECT we split known HTTPS-capable nodes to the
+        front first: only about a quarter of free proxies will tunnel, and
+        without this a single HTTPS request could burn all its retries on
+        proxies that answer 407 to CONNECT.
         """
         with self._lock:
             pool = [n for n in self._nodes if n.status == "alive"]
@@ -868,16 +1059,22 @@ class RotatingProxy:
                     self._warn_scope(*scope_empty)
                 return []
             if connect:
-                good = [n for n in pool if n.connect_ok is True]
-                unknown = [n for n in pool if n.connect_ok is None]
-                poor = [n for n in pool if n.connect_ok is False]
-                pool = (random.sample(good, len(good))
-                        + random.sample(unknown, len(unknown))
-                        + random.sample(poor, len(poor)))
+                parts = ([n for n in pool if n.connect_ok is True],
+                         [n for n in pool if n.connect_ok is None],
+                         [n for n in pool if n.connect_ok is False])
             else:
-                pool = random.sample(pool, len(pool))
-            k = min(int(self.settings["max_retries"]), len(pool))
-            return pool[:k]
+                parts = (pool,)
+            ordered: list[Node] = []
+            for part in parts:
+                buckets: dict[int, list[Node]] = {}
+                for n in part:
+                    buckets.setdefault(TIER_ORDER.get(n.strength, 2),
+                                       []).append(n)
+                for tier in sorted(buckets):
+                    group = buckets[tier]
+                    ordered += random.sample(group, len(group))
+            k = min(int(self.settings["max_retries"]), len(ordered))
+            return ordered[:k]
 
     def _note_failure(self, node: Node, reason: str) -> None:
         with self._lock:
@@ -885,6 +1082,7 @@ class RotatingProxy:
             node.status = "dead"
             node.last_error = reason
             node.last_check = time.time()
+            node.sample(0.0)
         self.log("warn", f"evicted {node.label} ({reason})")
 
     def _note_success(self, node: Node, latency_ms: float | None = None) -> None:
@@ -895,6 +1093,7 @@ class RotatingProxy:
             if latency_ms is not None:
                 node.latency = latency_ms
             node.last_error = ""
+            node.sample(1.0)
 
     # -- accept / dispatch ------------------------------------------------
     def _accept_loop(self, srv: socket.socket) -> None:
@@ -1054,7 +1253,27 @@ class RotatingProxy:
                     else f"http://{host}:{port}{path}")
         timeout = float(self.settings["connect_timeout"])
 
-        for node in self._candidates():
+        # Expect: 100-continue -- answer the client ourselves so it starts
+        # sending the body instead of stalling for its own timeout. The
+        # upstream never sees the header (stripped when heads are built).
+        if any(k.lower() == "expect" and "100-continue" in v.lower()
+               for k, v in headers):
+            try:
+                client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            except OSError:
+                return
+
+        # Only bodiless requests can rotate after the answer arrived: a
+        # POST body has already been consumed from the client by then and
+        # cannot be replayed through a different exit.
+        replayable = (not body_prefix
+                      and not any(k.lower() in ("content-length",
+                                                "transfer-encoding")
+                                  for k, _ in headers))
+        rotate = self.rotate_codes if replayable else frozenset()
+        candidates = self._candidates()
+
+        for i, node in enumerate(candidates):
             up = None
             try:
                 if node.proto == "http":
@@ -1083,6 +1302,27 @@ class RotatingProxy:
                 if _is_upstream_rejection(status):
                     raise OSError("upstream said "
                                   + status.decode("latin-1", "replace")[:60])
+
+                # The target itself said no (403/429/…): the proxy worked,
+                # but this exit's IP is likely on a blocklist -- so count it
+                # and, while other candidates remain, retry from a different
+                # IP. On the last candidate the answer is passed through.
+                code = _status_code(status)
+                if rotate and code in rotate:
+                    with self._lock:
+                        node.blocks += 1
+                    if i < len(candidates) - 1:
+                        with self._lock:
+                            node.sample(0.0)
+                        self.log("info",
+                                 f"{method} {host}{path} refused via "
+                                 f"{node.label} ({code}) — rotating to "
+                                 f"another exit")
+                        try:
+                            up.close()
+                        except OSError:
+                            pass
+                        continue
 
                 up.settimeout(None)
                 client.settimeout(None)
@@ -1138,12 +1378,25 @@ class RotatingProxy:
     def _build_upstream_head(method: str, request_target: str, host: str, port: int,
                              headers: list[tuple[str, str]]) -> bytes:
         """`request_target` is absolute-form for HTTP upstreams and
-        origin-form (a plain path) for SOCKS upstreams."""
+        origin-form (a plain path) for SOCKS upstreams.
+
+        Hop-by-hop headers never cross the proxy: the client's own
+        `Connection` tokens (RFC 7230 §6.1), the proxy-protocol headers and
+        `Expect` are dropped, while everything end-to-end -- cookies, User-
+        Agent, Accept, Authorization -- is forwarded byte for byte, so the
+        target sees exactly the headers the client sent.
+        """
+        drop = {"proxy-connection", "proxy-authorization", "proxy-authenticate",
+                "expect", "te", "keep-alive"}
+        for name, value in headers:
+            if name.lower() == "connection":
+                drop.update(tok.strip().lower() for tok in value.split(",")
+                            if tok.strip())
         lines = [f"{method} {request_target} HTTP/1.1"]
         seen_connection = False
         for name, value in headers:
             low = name.lower()
-            if low in ("proxy-connection", "proxy-authorization"):
+            if low in drop:
                 continue
             if low == "connection":
                 value, seen_connection = "close", True
@@ -1159,13 +1412,17 @@ class RotatingProxy:
                       headers: list[tuple[str, str]], prefix: bytes) -> int | None:
         """Copy the client's request body upstream. Returns bytes sent, or
         None if the client disconnected. Handles Content-Length, chunked
-        framing and no-body requests."""
-        if not prefix:
-            return 0
+        framing and no-body requests.
+
+        The body does not have to arrive glued to the headers: with
+        `Expect: 100-continue` (or simply a split TCP segment) the client
+        sends it only after we have answered, so an empty prefix must
+        still read whatever the framing declares.
+        """
         low = {n.lower(): v for n, v in headers}
         if "content-length" in low:
             remaining = int(low["content-length"])
-            chunks = [prefix]
+            chunks = [prefix] if prefix else []
             got = len(prefix)
             while got < remaining:
                 piece = client.recv(min(RELAY_CHUNK, remaining - got))
@@ -1180,8 +1437,10 @@ class RotatingProxy:
             return _forward_chunked(client, up, prefix)
 
         # no declared body: anything already read is pipelining, send as-is
-        up.sendall(prefix)
-        return len(prefix)
+        if prefix:
+            up.sendall(prefix)
+            return len(prefix)
+        return 0
 
     # -- relay ------------------------------------------------------------
     def _pipe(self, a: socket.socket, b: socket.socket,
@@ -1254,6 +1513,7 @@ class RotatingProxy:
             sock.settimeout(timeout)
             sock.sendall(b"GET http://example.com/ HTTP/1.1\r\n"
                          b"Host: example.com\r\n"
+                         + _PROBE_UA +
                          b"Connection: close\r\n\r\n")
             data = sock.recv(256)
             # any HTTP answer proves the hop forwards traffic (200, 30x, 403…)
@@ -1279,6 +1539,7 @@ class RotatingProxy:
         try:
             sock.sendall(b"GET / HTTP/1.1\r\n"
                          b"Host: example.com\r\n"
+                         + _PROBE_UA +
                          b"Connection: close\r\n\r\n")
             data = sock.recv(256)
             alive = data.startswith(b"HTTP/") or b"200" in data or b"30" in data
@@ -1376,6 +1637,7 @@ class RotatingProxy:
                         node.last_check = time.time()
                         node.last_error = "" if alive else err
                         node.failures = 0 if alive else node.failures + 1
+                        node.sample(1.0 if alive else 0.0)
                         if connect_ok is not None:
                             node.connect_ok = connect_ok
                         if node.connect_ok:
@@ -1394,13 +1656,15 @@ class RotatingProxy:
                 alive = sum(1 for n in self._nodes if n.status == "alive")
                 https = sum(1 for n in self._nodes
                             if n.status == "alive" and n.connect_ok)
+                strong = sum(1 for n in self._nodes if n.strength == "Strong")
                 code = str(self.settings.get("country") or "").upper()
                 https_only = bool(self.settings.get("https_only"))
                 scoped = [n for n in self._nodes if n.cc == code] if code else []
                 scoped_alive = sum(1 for n in scoped if n.status == "alive")
                 name = next((n.country for n in scoped if n.country), "")
             msg = (f"health check done in {secs:.1f}s — "
-                   f"{alive} alive ({https} tunnel HTTPS) of {total}")
+                   f"{alive} alive ({https} tunnel HTTPS) of {total}"
+                   f" · {strong} strong")
             if code:
                 msg += (f" · {name or code} ({code}): "
                         f"{scoped_alive} alive of {len(scoped)}"
@@ -1505,6 +1769,8 @@ class RotatingProxy:
                 pool_unknown=counts["unknown"],
                 pool_https=sum(1 for n in self._nodes if n.connect_ok),
                 pool_socks=sum(1 for n in self._nodes if n.proto != "http"),
+                pool_strong=sum(1 for n in self._nodes
+                                if n.strength == "Strong"),
                 host=self.host,
                 port=self.port,
                 checking=self._checking.is_set(),

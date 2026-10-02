@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only use upstreams that can tunnel HTTPS "
                         "(needed by most https:// sites); --no-https-only "
                         "turns it off again")
+    p.add_argument("--rotate-on", metavar="CODES",
+                   default=DEFAULTS["rotate_on"],
+                   help="comma-separated status codes that make a plain-HTTP "
+                        "request retry through a different exit because this "
+                        "one's IP was refused (default: %(default)s); "
+                        "empty switches the rotation off")
     return p
 
 
@@ -137,7 +143,8 @@ def run_check(args) -> int:
 def run_cli(args) -> int:
     settings = dict(host=args.host, port=args.port,
                     check_interval=args.check_interval,
-                    max_retries=args.max_retries)
+                    max_retries=args.max_retries,
+                    rotate_on=args.rotate_on)
     engine = RotatingProxy(proxies=args.proxy or list(PROXY_LIST), **settings)
     rank = {"debug": 0, "info": 1, "warn": 2, "error": 3}
     threshold = rank[args.log_level]

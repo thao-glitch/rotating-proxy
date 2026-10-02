@@ -919,6 +919,243 @@ def test_lifecycle():
         s.close()
 
 
+def test_rotate_on_block(target_port, mock_port):
+    print("\nrotate the exit when the target blocks it")
+    import engine as engine_mod
+    block_port = start_mock(reject_status="403")
+    logs = []
+    original = engine_mod.random.sample
+    # force configured order so the blocked exit is always tried first
+    engine_mod.random.sample = lambda seq, k: list(seq)[:k]
+    try:
+        eng = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                            proxies=[f"127.0.0.1:{block_port}",
+                                     f"127.0.0.1:{mock_port}"],
+                            max_retries=5)
+        free = _free_port()
+        eng.configure(port=free)
+        eng.start(probe_first=False)
+        try:
+            raw = http_get(free, f"127.0.0.1:{target_port}", "/rot")
+            check("recovered from a different exit",
+                  b"TARGET-GET /rot" in raw, raw[:90])
+            check("rotation logged",
+                  any("rotating to another exit" in m for _, m in logs),
+                  str(logs[-3:]))
+            nodes = {n["label"]: n for n in eng.nodes()}
+            blocked = f"127.0.0.1:{block_port}"
+            check("block counted on the node",
+                  nodes[blocked]["blocks"] == 1, str(nodes[blocked]))
+            check("blocked exit not evicted",
+                  blocked not in eng.proxies("dead"),
+                  str(eng.proxies("dead")))
+            snap = eng.snapshot()
+            check("counted as served",
+                  snap["served"] == 1 and snap["failed"] == 0,
+                  f"{snap['served']} / {snap['failed']}")
+        finally:
+            eng.stop()
+
+        # a single upstream means nowhere to rotate: the 403 is the
+        # target's answer and must reach the client untouched
+        eng2 = RotatingProxy(logger=quiet, proxies=[f"127.0.0.1:{block_port}"])
+        free2 = _free_port()
+        eng2.configure(port=free2)
+        eng2.start(probe_first=False)
+        try:
+            raw = http_get(free2, f"127.0.0.1:{target_port}", "/only")
+            status = raw.split(b"\r\n", 1)[0]
+            check("last candidate passes the block through",
+                  b" 403 " in status, status.decode(errors="replace")[:60])
+        finally:
+            eng2.stop()
+
+        # a request with a body cannot be replayed through another exit
+        eng3 = RotatingProxy(logger=quiet,
+                             proxies=[f"127.0.0.1:{block_port}",
+                                      f"127.0.0.1:{mock_port}"])
+        free3 = _free_port()
+        eng3.configure(port=free3)
+        eng3.start(probe_first=False)
+        try:
+            raw = http_post(free3, f"127.0.0.1:{target_port}", "/post", b"data")
+            status = raw.split(b"\r\n", 1)[0]
+            check("POST is not replayed",
+                  b" 403 " in status, status.decode(errors="replace")[:60])
+        finally:
+            eng3.stop()
+    finally:
+        engine_mod.random.sample = original
+
+
+def test_strength():
+    print("\nstrength tiers / regions / candidate preference")
+    from engine import Node, _tier, _rotate_codes, _validate_rotate_on, region_of
+
+    check("fresh node is New", _tier(None, 0) == "New")
+    check("one clean probe -> Good", _tier(1.0, 1) == "Good")
+    check("two clean probes -> Strong", _tier(1.0, 2) == "Strong")
+    check("steady failures -> Weak", _tier(0.0, 5) == "Weak")
+    check("0.7 stays Good", _tier(0.7, 5) == "Good")
+    check("0.5 falls to Weak", _tier(0.5, 5) == "Weak")
+    n = Node("1.2.3.4", 8080)
+    check("node strength before any data", n.strength == "New"
+          and n.as_dict()["samples"] == 0 and n.as_dict()["score"] is None)
+    n.sample(1.0)
+    n.sample(1.0)
+    check("node scores to Strong", n.strength == "Strong"
+          and n.as_dict()["score"] == 1.0)
+    n.sample(0.0)
+    check("EMA reacts to a failure", n.as_dict()["score"] < 1.0)
+
+    check("region Europe", region_of("DE") == "Europe")
+    check("region Asia", region_of("HK") == "Asia")
+    check("region Africa", region_of("ZW") == "Africa")
+    check("region lower-case ok", region_of("us") == "North America")
+    check("region unknown", region_of("") == "" and region_of("ZZ") == "")
+    check("region travels with the node",
+          Node("1.2.3.4", 80, cc="FR").as_dict()["region"] == "Europe")
+
+    eng = RotatingProxy(logger=quiet, proxies=["9.9.9.9:8080", "8.8.8.8:8080"])
+    eng._nodes[0].status = "alive"
+    eng._nodes[0].sample(1.0)
+    eng._nodes[0].sample(1.0)
+    eng._nodes[0].blocks = 3
+    eng.set_proxies(["9.9.9.9:8080"])          # edit the list, keep the health
+    again = eng.nodes()[0]
+    check("score survives a list edit",
+          again["samples"] == 2 and again["strength"] == "Strong"
+          and again["blocks"] == 3, str(again))
+
+    # the strong exit must be offered before the weak one, always
+    eng.set_proxies(["9.9.9.9:8080", "8.8.8.8:8080"])
+    for node in eng._nodes:
+        node.status = "alive"
+    strong, weak = eng._nodes[0], eng._nodes[1]
+    strong.sample(1.0)
+    strong.sample(1.0)
+    weak.sample(0.0)
+    weak.sample(0.0)
+    weak.sample(0.0)
+    check("tiers differ", strong.strength == "Strong"
+          and weak.strength == "Weak",
+          f"{strong.strength} / {weak.strength}")
+    firsts = [eng._candidates()[0].label for _ in range(6)]
+    check("strong exit offered first",
+          all(label == "9.9.9.9:8080" for label in firsts), str(firsts))
+    check("weak stays in rotation", len(eng._candidates()) == 2)
+    check("snapshot counts the strong",
+          eng.snapshot()["pool_strong"] == 1, str(eng.snapshot()["pool_strong"]))
+
+    check("codes parsed", _rotate_codes("403, 429;999") == {403, 429, 999})
+    check("junk skipped", _rotate_codes("banana,,403") == {403})
+    check("empty disables", _rotate_codes("") == set())
+    check("validated + normalised", _validate_rotate_on("429; 503") == "429,503")
+    try:
+        _validate_rotate_on("blocked")
+        check("bad list rejected", False, "no error raised")
+    except ValueError:
+        check("bad list rejected", True)
+    check("default on", RotatingProxy(logger=quiet).settings["rotate_on"]
+          == "403,429,999")
+    check("hand-edited garbage falls back",
+          RotatingProxy(logger=quiet, rotate_on="nonsense").settings["rotate_on"]
+          == "403,429,999")
+    eng2 = RotatingProxy(logger=quiet)
+    try:
+        eng2.configure(rotate_on="banana")
+        check("configure rejects junk", False, "no error raised")
+    except ValueError:
+        check("configure rejects junk", True)
+    check("configure normalises",
+          eng2.configure(rotate_on="403, 429")["rotate_on"] == "403,429")
+    check("rotation can be switched off",
+          eng2.configure(rotate_on="")["rotate_on"] == "")
+
+
+def test_socks4a_remote_dns(target_port, socks4_port):
+    print("\nSOCKS4a remote DNS")
+    import engine as engine_mod
+    eng, free = _socks_engine(socks4_port, "socks4")
+    real = engine_mod._resolve_ipv4
+
+    def boom(_host):
+        raise AssertionError("local DNS was used for a hostname")
+
+    engine_mod._resolve_ipv4 = boom
+    try:
+        raw = http_get(free, f"localhost:{target_port}", "/4a")
+        check("hostname dialed through the exit",
+              b"TARGET-GET /4a" in raw, raw[:90])
+        check("upstream still marked alive",
+              eng.proxies("alive") == [f"socks4://127.0.0.1:{socks4_port}"],
+              str(eng.proxies()))
+    finally:
+        engine_mod._resolve_ipv4 = real
+        eng.stop()
+
+
+def test_header_hygiene():
+    print("\nhop-by-hop header hygiene")
+    build = RotatingProxy._build_upstream_head
+    head = build("GET", "http://example.com/x", "example.com", 80,
+                 [("Host", "example.com"), ("Connection", "close, X-Secret"),
+                  ("X-Secret", "hunter2"), ("X-Keep", "yes"),
+                  ("Proxy-Connection", "keep-alive"),
+                  ("Proxy-Authorization", "Basic dXNlcg=="),
+                  ("Expect", "100-continue"), ("User-Agent", "UA/1.0"),
+                  ("Cookie", "sid=1")])
+    check("Connection token stripped", b"X-Secret" not in head)
+    check("end-to-end header kept", b"X-Keep: yes" in head)
+    check("User-Agent forwarded verbatim", b"User-Agent: UA/1.0" in head)
+    check("Cookie forwarded verbatim", b"Cookie: sid=1" in head)
+    check("Proxy-Connection dropped", b"Proxy-Connection" not in head)
+    check("Proxy-Authorization dropped", b"Proxy-Authorization" not in head)
+    check("Expect dropped", b"Expect" not in head)
+    check("Connection rewritten to close", b"Connection: close" in head)
+
+    head2 = build("GET", "/p", "example.com", 8080,
+                  [("Host", "example.com"), ("Accept", "*/*")])
+    check("origin-form target for SOCKS", head2.startswith(b"GET /p HTTP/1.1"))
+    check("Host rebuilt with the port", b"Host: example.com:8080" in head2)
+    check("Connection appended when absent",
+          head2.rstrip().endswith(b"Connection: close"))
+
+
+def test_expect_continue(target_port, mock_port):
+    print("\nExpect: 100-continue")
+    eng = RotatingProxy(logger=quiet, proxies=[f"127.0.0.1:{mock_port}"])
+    free = _free_port()
+    eng.configure(port=free)
+    eng.start(probe_first=False)
+    try:
+        payload = b"e" * 100
+        s = socket.create_connection(("127.0.0.1", free), timeout=8)
+        try:
+            s.settimeout(4)
+            s.sendall(
+                f"POST http://127.0.0.1:{target_port}/exp HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{target_port}\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"Content-Type: text/plain\r\n"
+                f"Expect: 100-continue\r\nConnection: close\r\n\r\n".encode())
+            early = b""
+            try:
+                early = s.recv(256)
+            except socket.timeout:
+                pass
+            check("100 Continue answered promptly",
+                  b"100 Continue" in early, early[:70])
+            s.sendall(payload)
+            rest = _drain(s)
+            check("body accepted after the 100",
+                  b"TARGET-POST len=100" in rest, rest[:90])
+        finally:
+            s.close()
+    finally:
+        eng.stop()
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -956,6 +1193,11 @@ def main():
         test_stats_and_list_ops,
         test_country,
         test_https_only,
+        lambda: test_rotate_on_block(target_port, mock_port),
+        test_strength,
+        lambda: test_socks4a_remote_dns(target_port, socks4_port),
+        test_header_hygiene,
+        lambda: test_expect_continue(target_port, mock_port),
         test_lifecycle,
     ]
 
