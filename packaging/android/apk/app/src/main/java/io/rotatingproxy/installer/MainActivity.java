@@ -9,6 +9,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -155,7 +156,7 @@ public class MainActivity extends Activity {
 
     private void openAppSettings() {
         try {
-            startActivity(new Intent(Intent.ACTION_APPLICATION_DETAILS_SETTINGS,
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     Uri.parse("package:" + getPackageName())));
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, "Could not open app settings.",
