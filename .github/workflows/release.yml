@@ -194,11 +194,19 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
       - name: Install SDK packages
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          # the runner ships a full Android SDK; the setup-android action
+          # chokes on the removed legacy 'tools' package, so skip it and
+          # drive the bundled sdkmanager directly
+          SDKM="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}" \
+                  -name sdkmanager -type f | sort | tail -n1)"
+          test -n "$SDKM" || { echo "::error::sdkmanager not found"; exit 1; }
+          echo "using $SDKM"
+          yes | "$SDKM" --licenses >/dev/null || true
+          yes | "$SDKM" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          test -d "${ANDROID_HOME}/platforms/android-34"
+          test -d "${ANDROID_HOME}/build-tools/34.0.0"
       - name: Install Gradle 8.9
         run: |
           curl -fsSL -o /tmp/gradle.zip \
