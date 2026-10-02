@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rotating Proxy
+GenericName=Rotating HTTP/SOCKS proxy
+Comment=Local forwarding proxy that rotates across a pool of upstreams
+Exec=rotating-proxy
+Icon=rotating-proxy
+Terminal=false
+Categories=Network;Monitor;
+Keywords=proxy;http;socks;forwarding;
+StartupNotify=true

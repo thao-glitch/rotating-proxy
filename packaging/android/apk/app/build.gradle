@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+}
+
+def keyStore = project.findProperty('RP_KEYSTORE')
+
+android {
+    namespace 'io.rotatingproxy.installer'
+    compileSdk 34
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "io.rotatingproxy.installer"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName (project.findProperty('RP_VERSION') ?: '1.0').toString()
+
+        buildConfigField "String", "RELEASE_SCRIPT_URL",
+            "\"https://github.com/${project.findProperty('repoSlug') ?: 'OWNER/REPO_PLACEHOLDER'}/releases/latest/download/rotating-proxy-install-termux.sh\""
+    }
+
+    signingConfigs {
+        release {
+            if (keyStore) {
+                storeFile file(keyStore)
+                storePassword project.findProperty('RP_KEYSTORE_PASSWORD')
+                keyAlias project.findProperty('RP_KEY_ALIAS')
+                keyPassword project.findProperty('RP_KEY_PASSWORD')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Always-signed APK: a provided release keystore wins, otherwise
+            // fall back to the debug keystore (never ship unsigned).
+            signingConfig keyStore ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

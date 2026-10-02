@@ -1,0 +1,286 @@
+# Build every desktop/mobile installer from one tag push and publish
+# them as a GitHub Release.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Test suites run on every push; the packaging jobs and the release
+# itself only run for tags matching v*.
+#
+# Release assets:
+#   RotatingProxy-<v>-win64.exe              Windows installer (per-user)
+#   RotatingProxy-<v>-macos-silicon.pkg      Apple Silicon installer
+#   RotatingProxy-<v>-macos-intel.pkg        Intel installer
+#   rotating-proxy_<v>_amd64.deb             Debian/Ubuntu package
+#   RotatingProxy-<v>-x86_64.AppImage        Linux portable
+#   RotatingProxy-<v>-android.apk            Android bootstrap app
+#   rotating-proxy-install-termux.sh         Termux installer (manual use)
+#
+name: release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------- tests
+  test:
+    name: test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-tk xvfb
+          sudo apt-get install -y -q python3-geoip geoip-database || true
+      - name: engine (120 checks)
+        run: python3 test_engine.py
+      - name: proxyctl (115 checks)
+        run: python3 test_proxyctl.py
+      - name: gui (122 checks)
+        run: xvfb-run -a python3 test_gui.py
+
+  # -------------------------------------------------------------- windows
+  windows:
+    name: windows installer
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Build bundle
+        shell: bash
+        run: APP_VERSION="${GITHUB_REF_NAME#v}" pyinstaller packaging/rotating-proxy.spec
+      - name: Smoke-test the console tool
+        shell: pwsh
+        run: |
+          & .\dist\rotating-proxy\proxyctl.exe help
+          if ($LASTEXITCODE -ne 0) { throw "proxyctl failed" }
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            foreach ($dir in @("$env:ProgramFiles\Inno Setup 6",
+                               "${env:ProgramFiles(x86)}\Inno Setup 6")) {
+              if (Test-Path "$dir\ISCC.exe") { $iscc = "$dir\ISCC.exe"; break }
+            }
+          }
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc "/DAppVersion=$ver" "packaging\windows\setup.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: dist/installer/*.exe
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- macos
+  macos:
+    name: macos pkg (${{ matrix.label }})
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            label: intel
+          - runner: macos-15
+            label: silicon
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+      - name: Build bundle
+        run: APP_VERSION="${GITHUB_REF_NAME#v}" pyinstaller packaging/rotating-proxy.spec
+      - name: Smoke-test the CLI
+        run: |
+          test -d "dist/Rotating Proxy.app"
+          dist/rotating-proxy/proxyctl help
+      - name: Build installer package
+        env:
+          # optional: set this secret to sign+identify the .pkg
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          out="dist/RotatingProxy-${ver}-macos-${{ matrix.label }}.pkg"
+          bash packaging/macos/build-pkg.sh "$ver" "dist/Rotating Proxy.app" "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-macos-${{ matrix.label }}
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- linux
+  linux:
+    name: linux packages
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-tk python3-venv xvfb desktop-file-utils
+          # optional: bundled GeoIP bindings for country labels
+          sudo apt-get install -y -q python3-geoip geoip-database || true
+      - name: Install PyInstaller
+        run: |
+          python3 -m venv /tmp/buildenv
+          /tmp/buildenv/bin/pip install -q pyinstaller
+      - name: Build bundle
+        run: APP_VERSION="${GITHUB_REF_NAME#v}" /tmp/buildenv/bin/pyinstaller packaging/rotating-proxy.spec
+      - name: Smoke-test the bundle
+        run: |
+          dist/rotating-proxy/rotating-proxy --help >/dev/null
+          dist/rotating-proxy/proxyctl help >/dev/null
+          set +e
+          xvfb-run -a timeout --signal=TERM 8 dist/rotating-proxy/rotating-proxy --no-autostart
+          rc=$?
+          set -e
+          # 0 = graceful SIGTERM close, 124 = still alive when timeout hit
+          test "$rc" -eq 0 -o "$rc" -eq 124
+          test -s "$HOME/.config/rotating-proxy/proxy_state.json"
+          echo "bundle smoke test OK"
+      - name: Build .deb
+        run: bash packaging/linux/build-deb.sh "${GITHUB_REF_NAME#v}"
+      - name: Build AppImage
+        run: bash packaging/linux/build-appimage.sh "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-linux
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- android
+  android:
+    name: android apk + termux script
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render the Termux installer
+        run: |
+          mkdir -p dist
+          sed -e "s|@REPO@|${GITHUB_REPOSITORY}|g" \
+              -e "s|@TAG@|${GITHUB_REF_NAME}|g" \
+              packaging/android/install-termux.sh \
+              > dist/rotating-proxy-install-termux.sh
+          bash -n dist/rotating-proxy-install-termux.sh
+          grep -q "REPO=\"${GITHUB_REPOSITORY}\"" dist/rotating-proxy-install-termux.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null
+      - name: Install Gradle 8.9
+        run: |
+          curl -fsSL -o /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q /tmp/gradle.zip -d "$HOME/tools"
+          echo "$HOME/tools/gradle-8.9/bin" >> "$GITHUB_PATH"
+      - name: Restore keystore (keeps APK signatures stable across releases)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rotating-proxy.jks
+          key: rotating-proxy-android-keystore-v1
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'android' }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS || 'rotating-proxy' }}
+          KS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
+        run: |
+          ks="$RUNNER_TEMP/rotating-proxy.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$ks"
+          elif [ ! -s "$ks" ]; then
+            keytool -genkeypair -keystore "$ks" -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KS_PASSWORD" -keypass "$KS_KEY_PASSWORD" \
+              -dname "CN=Rotating Proxy, OU=Release, O=Rotating Proxy, C=US" \
+              >/dev/null 2>&1
+            echo "::warning::no ANDROID_KEYSTORE_B64 secret -- generated a throwaway key (cached for later runs)"
+          fi
+      - name: Build APK
+        env:
+          ORG_GRADLE_PROJECT_repoSlug: ${{ github.repository }}
+          ORG_GRADLE_PROJECT_RP_VERSION: ${{ github.ref_name }}
+          ORG_GRADLE_PROJECT_RP_KEYSTORE: ${{ runner.temp }}/rotating-proxy.jks
+          ORG_GRADLE_PROJECT_RP_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'android' }}
+          ORG_GRADLE_PROJECT_RP_KEY_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS || 'rotating-proxy' }}
+          ORG_GRADLE_PROJECT_RP_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'android' }}
+        run: |
+          gradle -p packaging/android/apk assembleRelease --stacktrace
+          apk="packaging/android/apk/app/build/outputs/apk/release/app-release.apk"
+          test -f "$apk"
+          cp "$apk" "dist/RotatingProxy-${GITHUB_REF_NAME#v}-android.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-android
+          path: |
+            dist/*.apk
+            dist/*.sh
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- release
+  release:
+    name: publish release
+    needs: [test, windows, macos, linux, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \
+            \( -name '*.exe' -o -name '*.pkg' -o -name '*.deb' \
+               -o -name '*.AppImage' -o -name '*.apk' -o -name '*.sh' \) \
+            -exec mv {} release-assets/ \;
+          ls -la release-assets
+          test "$(find release-assets -type f | wc -l)" -ge 6
+      - name: Create (or update) the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" \
+              --verify-tag \
+              --title "Rotating Proxy $tag" \
+              --generate-notes \
+              release-assets/*
+          fi

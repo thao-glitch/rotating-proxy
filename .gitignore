@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller / packaging scratch (artifacts live in dist/, which is
+# rebuilt from scratch by CI on every release)
+build/
+dist/
+
+# local tooling
+.venv/
+venv/
+
+# Gradle (CI builds from a clean checkout)
+packaging/android/apk/.gradle/
+packaging/android/apk/build/
+packaging/android/apk/app/build/
+packaging/android/apk/local.properties
+
+# editors / OS
+*.swp
+.DS_Store
