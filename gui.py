@@ -37,7 +37,8 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from appstate import state_file
-from engine import DEFAULTS, RotatingProxy, parse_entry, region_of
+from engine import (DEFAULTS, FAST_MS, RotatingProxy, USE_FLAGS,
+                    parse_entry, region_of)
 from proxylist import PROXY_LIST
 import proxyctl
 
@@ -110,20 +111,41 @@ def _init_fonts(root: tk.Tk) -> None:
 # small widgets
 # ---------------------------------------------------------------------------
 class StatCard(tk.Frame):
-    """One big number with a caption, drawn as a white card."""
+    """One big number with a caption, drawn as a white card.
+
+    At the window's minimum width the six cards sit narrower than their
+    text, so the number steps down through smaller font sizes and the
+    caption wraps — both measured with the real font metrics, so nothing
+    is clipped whatever the platform's fonts look like.
+    """
 
     def __init__(self, parent, caption: str):
-        super().__init__(parent, bg=PANEL, padx=16, pady=11,
+        super().__init__(parent, bg=PANEL, padx=10, pady=11,
                          highlightbackground=BORDER, highlightthickness=1,
                          highlightcolor=ACCENT)
-        self.value = tk.Label(self, text="—", bg=PANEL, fg=TEXT, font=F["big"])
+        self._value_font = tkfont.Font(family=F["big"][0], size=F["big"][1],
+                                       weight="bold")
+        self.value = tk.Label(self, text="—", bg=PANEL, fg=TEXT,
+                              font=self._value_font)
         self.caption = tk.Label(self, text=caption.upper(), bg=PANEL, fg=MUTED,
                                 font=F["cap"])
         self.value.pack(anchor="w")
         self.caption.pack(anchor="w")
+        self.bind("<Configure>", self._refit)
 
     def set(self, text: str, color: str = TEXT) -> None:
         self.value.configure(text=text, fg=color)
+        self._refit()
+
+    def _refit(self, _event=None) -> None:
+        """Keep both lines inside the card at any window width."""
+        avail = max(48, self.winfo_width() - 24)     # padding + border
+        text = str(self.value.cget("text"))
+        for size in (19, 17, 15, 13, 11, 9):
+            self._value_font.configure(size=size)
+            if self._value_font.measure(text) <= avail:
+                break
+        self.caption.configure(wraplength=avail)
 
 
 class SectionBar(tk.Frame):
@@ -187,8 +209,8 @@ class ProxyGUI(tk.Tk):
         _init_fonts(self)
 
         settings, proxies = self._load_state()
-        # restored before the widgets are built, so the checkbox and the
-        # "Exit via" picker open showing what the engine actually does
+        # restored before the widgets are built, so the routing chips and
+        # the "Exit via" picker open showing what the engine actually does
         self._https_var.set(bool(settings.get("https_only")))
         self.engine = RotatingProxy(logger=self._on_engine_log,
                                     proxies=proxies, **settings)
@@ -199,8 +221,11 @@ class ProxyGUI(tk.Tk):
         self._main = tk.Frame(self, bg=BG)
         self._main.pack(side="left", fill="both", expand=True)
         self._build_cards()
-        self._build_body()
+        # the statusbar must be packed BEFORE the body: the body fills its
+        # cavity with expand=True, so anything packed afterwards is left
+        # with no space and never appears (this is how the bar went missing)
         self._build_statusbar()
+        self._build_body()
         self._build_dialogs()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -412,16 +437,24 @@ class ProxyGUI(tk.Tk):
         tk.Label(bar, text="Exit via", bg=PANEL_2, fg=MUTED,
                  font=F["small"]).pack(side="left", padx=(16, 4))
         self.country_combo = ttk.Combobox(
-            bar, textvariable=self._country_var, width=20, state="readonly",
+            bar, textvariable=self._country_var, width=18, state="readonly",
             values=["Anywhere"])
         self.country_combo.pack(side="left")
         self.country_combo.bind("<<ComboboxSelected>>", self._on_country_pick)
 
-        # ---- only route through upstreams that can tunnel HTTPS ----------
-        self.https_check = ttk.Checkbutton(
-            bar, text="HTTPS only", variable=self._https_var,
-            style="TCheckbutton", command=self._on_https_toggle)
-        self.https_check.pack(side="left", padx=(14, 0))
+        # ---- routing scope: which proxies the engine may use at all ------
+        usebar = tk.Frame(pool, bg=PANEL_2, padx=12, pady=5)
+        usebar.pack(fill="x")
+        tk.Label(usebar, text="Use", bg=PANEL_2, fg=MUTED,
+                 font=F["small"]).pack(side="left", padx=(0, 8))
+        self.use_chips: dict[str, tk.Button] = {}
+        for flag, label in (("http", "HTTP"), ("https", "HTTPS"),
+                            ("socks4", "SOCKS4"), ("socks5", "SOCKS5"),
+                            ("strong", "Strong"), ("fast", "Fast")):
+            chip = self._make_chip(usebar, label, flag)
+            chip.pack(side="left", padx=(0, 6))
+            self.use_chips[flag] = chip
+        self._sync_use_chips()
 
         filt = tk.Frame(pool, bg=PANEL_2, padx=12, pady=7)
         filt.pack(fill="x")
@@ -743,7 +776,7 @@ class ProxyGUI(tk.Tk):
             return node.get("strength") == "Strong"
         if choice == "Fast":
             latency = node.get("latency")
-            return latency is not None and latency <= 300
+            return latency is not None and latency <= FAST_MS
         return status == "unknown"
 
     def _sort_by(self, column: str):
@@ -843,7 +876,36 @@ class ProxyGUI(tk.Tk):
             tally.append(f"exit {code}")
         if self.engine.https_only:
             tally.append("HTTPS only")
-        self.pool_count.configure(text=" · ".join(tally))
+        # at the window's minimum the filter row runs out of room: drop
+        # the nice-to-have items (least important first) rather than
+        # clipping the counter.  The spare room is measured against the
+        # row and the real font -- never against the label's own width,
+        # which is stale the instant the text changes -- and the next
+        # poll rebuilds the full list as soon as there is space again.
+        text = " · ".join(tally)
+        room = self._tally_room()
+        font = self._tally_font()
+        while len(tally) > 1 and font.measure(text) > room:
+            tally.pop()
+            text = " · ".join(tally)
+        self.pool_count.configure(text=text)
+
+    def _tally_room(self) -> int:
+        """Pixels the filter row can spare for the pool counter."""
+        row = self.pool_count.master
+        used = sum(c.winfo_width() for c in row.children.values()
+                   if c is not self.pool_count)
+        # gaps, the row's own padding and the counter's left padding
+        return max(0, row.winfo_width() - used - 20)
+
+    def _tally_font(self):
+        """The font the counter really draws with, for width measuring."""
+        spec = self.pool_count.cget("font")
+        try:
+            return tkfont.Font(font=spec) if spec else \
+                tkfont.nametofont("TkDefaultFont")
+        except tk.TclError:
+            return tkfont.nametofont("TkDefaultFont")
         if force:
             self.tree.update_idletasks()
 
@@ -926,8 +988,63 @@ class ProxyGUI(tk.Tk):
             self._https_var.set(self.engine.https_only)
             return
         self._save_state()
+        self._sync_use_chips()
         self.status_var.set("HTTPS-only routing is "
                             f"{'on' if self.engine.https_only else 'off'}.")
+        self._render_pool(force=True)
+
+    # ---- routing chips (the "Use" row above the pool table) -------------
+    def _make_chip(self, parent, text, flag):
+        """A pill toggle that narrows what the engine may route through.
+
+        HTTPS rides the existing `https_only` setting (one source of truth
+        with the old checkbox it replaces); the other flags toggle entries
+        in the engine's `use_only` scope.
+        """
+        return tk.Button(
+            parent, text=text, relief="flat", bd=0, padx=9, pady=2,
+            font=F["small"], cursor="hand2", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=BORDER,
+            activebackground="#eef1f5", activeforeground=TEXT,
+            command=(self._on_https_chip if flag == "https"
+                     else lambda f=flag: self._toggle_use(f)))
+
+    def _sync_use_chips(self):
+        """Paint each chip from the engine's actual routing scope."""
+        flags = set(self.engine.use_flags)
+        https = bool(self.engine.https_only)
+        for flag, chip in self.use_chips.items():
+            on = https if flag == "https" else (flag in flags)
+            chip.configure(bg=ACCENT if on else PANEL,
+                           fg="#ffffff" if on else MUTED,
+                           highlightbackground=ACCENT if on else BORDER,
+                           activebackground="#1d4ed8" if on else "#eef1f5",
+                           activeforeground="#ffffff" if on else TEXT)
+
+    def _chip_on(self, flag: str) -> bool:
+        """True when the chip for `flag` is currently lit."""
+        chip = self.use_chips.get(flag)
+        return bool(chip) and str(chip.cget("bg")) == ACCENT
+
+    def _on_https_chip(self):
+        self._https_var.set(not self._https_var.get())
+        self._on_https_toggle()
+
+    def _toggle_use(self, flag: str):
+        """Add or remove one routing flag — which proxies may be used."""
+        flags = set(self.engine.use_flags)
+        flags.symmetric_difference_update({flag})
+        try:
+            self.engine.set_use(",".join(sorted(flags)))
+        except ValueError as exc:
+            self._append_log(time.time(), "error", f"use scope: {exc}")
+            return
+        self._sync_use_chips()
+        self._save_state()
+        active = [f for f in USE_FLAGS if f in self.engine.use_flags]
+        self.status_var.set("Routing scope: "
+                            + (", ".join(active) if active
+                               else "any upstream"))
         self._render_pool(force=True)
 
     @staticmethod

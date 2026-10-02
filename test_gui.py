@@ -264,13 +264,12 @@ def test_https_toggle(app):
     try:
         check("starts off", app._https_var.get() is False
               and app.engine.https_only is False)
-        check("checkbox shows off",
-              not app.https_check.instate(["selected"]))
+        check("chip shows off", not app._chip_on("https"))
 
         app._https_var.set(True)
         app._on_https_toggle()
         check("toggle reaches the engine", app.engine.https_only is True)
-        check("checkbox follows", app.https_check.instate(["selected"]))
+        check("chip follows", app._chip_on("https"))
         pick = [n.label for n in app.engine._candidates()]
         check("rotation drops non-tunnellers",
               len(pick) == 3 and all(
@@ -297,7 +296,7 @@ def test_https_toggle(app):
         app._https_var.set(False)
         app._on_https_toggle()
         check("toggle off", app.engine.https_only is False
-              and not app.https_check.instate(["selected"]))
+              and not app._chip_on("https"))
         check("candidates restored", len(app.engine._candidates()) == 5,
               str(len(app.engine._candidates())))
         saved = json.loads(Path(gui.STATE_FILE).read_text(encoding="utf-8"))
@@ -308,6 +307,92 @@ def test_https_toggle(app):
         app._https_var.set(False)
         app.engine.set_https_only(False)
         app._status_var.set("All")
+        app._render_pool(force=True)
+
+
+def test_use_chips(app):
+    """The "Use" row: buttons that scope which proxies the engine routes."""
+    print("\nrouting chips (Use row)")
+    import json
+    labels = ["10.0.0.1:8080", "socks4://10.0.0.2:1080",
+              "socks5://10.0.0.3:1080", "socks5://10.0.0.4:1080",
+              "10.0.0.5:8080"]
+    app.engine.set_proxies(labels)
+    latencies = (120.0, 900.0, 150.0, 40.0, 80.0)
+    for i, n in enumerate(app.engine._nodes):
+        n.status = "alive"
+        n.latency = latencies[i]
+    app.engine._nodes[2].score = 0.95        # the one Strong entry
+    app.engine._nodes[2].samples = 3
+    try:
+        check("six chips built",
+              set(app.use_chips) == {"http", "https", "socks4", "socks5",
+                                     "strong", "fast"},
+              str(sorted(app.use_chips)))
+        check("chips start unlit",
+              not any(app._chip_on(f) for f in app.use_chips))
+        check("scope starts empty", app.engine.use_flags == frozenset())
+
+        app._toggle_use("socks5")
+        check("socks5 chip lights", app._chip_on("socks5"))
+        check("engine scope updated",
+              app.engine.use_flags == frozenset({"socks5"}))
+        pick = {n.label for n in app.engine._candidates()}
+        check("candidates limited to socks5",
+              pick == {"socks5://10.0.0.3:1080", "socks5://10.0.0.4:1080"},
+              str(sorted(pick)))
+        saved = json.loads(Path(gui.STATE_FILE).read_text(encoding="utf-8"))
+        check("scope written to the state file",
+              saved["settings"].get("use_only") == "socks5",
+              str(saved["settings"].get("use_only")))
+
+        app._toggle_use("http")
+        check("two flags combine",
+              app.engine.use_flags == frozenset({"http", "socks5"})
+              and app._chip_on("http"), str(app.engine.use_flags))
+        pick = {n.label for n in app.engine._candidates()}
+        check("candidates widen to http+socks5",
+              pick == {"10.0.0.1:8080", "socks5://10.0.0.3:1080",
+                       "socks5://10.0.0.4:1080", "10.0.0.5:8080"},
+              str(sorted(pick)))
+        app._toggle_use("http")
+        app._toggle_use("socks5")
+        check("chips off again",
+              app.engine.use_flags == frozenset()
+              and not app._chip_on("socks5") and not app._chip_on("http"))
+
+        app._toggle_use("strong")
+        check("strong scope",
+              {n.label for n in app.engine._candidates()}
+              == {"socks5://10.0.0.3:1080"},
+              str([n.label for n in app.engine._candidates()]))
+        app._toggle_use("strong")
+
+        app._toggle_use("fast")
+        check("fast scope drops slow and unmeasured",
+              {n.label for n in app.engine._candidates()}
+              == {"10.0.0.1:8080", "socks5://10.0.0.3:1080",
+                  "socks5://10.0.0.4:1080", "10.0.0.5:8080"},
+              str([n.label for n in app.engine._candidates()]))
+        app._toggle_use("fast")
+
+        # the HTTPS chip rides the pre-existing https_only switch
+        app._on_https_chip()
+        check("https chip flips the engine", app.engine.https_only is True)
+        check("https chip lit", app._chip_on("https"))
+        app._on_https_chip()
+        check("https chip back off",
+              app.engine.https_only is False
+              and not app._chip_on("https"))
+        check("status bar explains the scope",
+              "Routing scope" in app.status_var.get()
+              or app.status_var.get().startswith("HTTPS"),
+              app.status_var.get())
+    finally:
+        app.engine.set_use("")
+        app.engine.set_https_only(False)
+        app._https_var.set(False)
+        app._sync_use_chips()
         app._render_pool(force=True)
 
 
@@ -800,6 +885,7 @@ def main():
         test_pool_render(app)
         test_country(app)
         test_https_toggle(app)
+        test_use_chips(app)
         test_categories(app)
         test_log(app)
         test_dialogs(app)

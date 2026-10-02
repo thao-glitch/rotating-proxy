@@ -40,11 +40,11 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q python3-tk xvfb
           sudo apt-get install -y -q python3-geoip geoip-database || true
-      - name: engine (192 checks)
+      - name: engine (207 checks)
         run: python3 test_engine.py
       - name: proxyctl (115 checks)
         run: python3 test_proxyctl.py
-      - name: gui (135 checks)
+      - name: gui (151 checks)
         run: xvfb-run -a python3 test_gui.py
 
   # -------------------------------------------------------------- windows

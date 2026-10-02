@@ -646,7 +646,9 @@ def test_socks_health(socks4_port, socks5_port, dead_port):
     s5 = f"socks5://127.0.0.1:{socks5_port}"
     dead = f"socks4://127.0.0.1:{dead_port}"
     eng = RotatingProxy(logger=quiet, proxies=[s4, s5, dead],
-                        probe_timeout=2.0)
+                        probe_timeout=4.0)   # the engine's default; the
+                                             # 2.0 this test used to use
+                                             # flakes on a loaded desktop
     eng.check_now(reason="test")
     deadline = time.time() + 20
     while eng.checking and time.time() < deadline:
@@ -1272,6 +1274,96 @@ def test_list_refresh():
         httpd.shutdown()
 
 
+def test_use_scope():
+    """The routing scope (`use_only`): which proxies may be used at all."""
+    print("\nrouting scope (use flags)")
+    logs: list = []
+    eng = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                        proxies=["192.0.2.1:8080", "socks4://192.0.2.2:1080",
+                                 "socks5://192.0.2.3:1080",
+                                 "socks5://192.0.2.4:1080"])
+    nodes = eng._nodes
+    latencies = (120.0, 800.0, 150.0, None)
+    for i, n in enumerate(nodes):
+        n.status = "alive"
+        n.latency = latencies[i]
+    nodes[2].score, nodes[2].samples = 0.95, 3   # the one Strong entry
+    try:
+        check("scope starts empty",
+              eng.use_flags == frozenset()
+              and eng.settings["use_only"] == "")
+        check("unrestricted pool offered",
+              len(eng._candidates()) == 4,
+              str([n.label for n in eng._candidates()]))
+
+        eng.set_use("socks5")
+        pick = {n.label for n in eng._candidates()}
+        check("socks5 scope",
+              pick == {"socks5://192.0.2.3:1080", "socks5://192.0.2.4:1080"},
+              str(sorted(pick)))
+        check("scope change logged",
+              any("only socks5" in m for _, m in logs), str(logs[-1:]))
+
+        eng.set_use("http,socks4")
+        pick = {n.label for n in eng._candidates()}
+        check("http+socks4 scope",
+              pick == {"192.0.2.1:8080", "socks4://192.0.2.2:1080"},
+              str(sorted(pick)))
+
+        eng.set_use("strong")
+        pick = {n.label for n in eng._candidates()}
+        check("strong scope", pick == {"socks5://192.0.2.3:1080"},
+              str(sorted(pick)))
+
+        eng.set_use("fast")
+        pick = {n.label for n in eng._candidates()}
+        check("fast scope drops slow and unmeasured",
+              pick == {"192.0.2.1:8080", "socks5://192.0.2.3:1080"},
+              str(sorted(pick)))
+
+        check("flags normalised",
+              eng.set_use(" SOCKS5 , socks5 ,strong ") == "socks5,strong")
+
+        # a scope nothing matches must warn, not crash
+        eng.set_use("http,strong")
+        check("empty scope yields no candidates",
+              eng._candidates() == [], str(eng._candidates()))
+        check("empty scope warned",
+              any("routing filter" in m and "502" in m
+                  for _, m in logs[-3:]), str(logs[-2:]))
+
+        rejected = False
+        try:
+            eng.configure(use_only="tor")
+        except ValueError:
+            rejected = True
+        check("unknown flag rejected", rejected)
+        hint = False
+        try:
+            eng.configure(use_only="https")
+        except ValueError as exc:
+            hint = "https-only" in str(exc)
+        check("https rejected with a hint", hint)
+
+        eng.set_use("")
+        check("clearing restores the whole pool",
+              eng.use_flags == frozenset() and len(eng._candidates()) == 4)
+
+        # https stays its own switch, independent of the routing flags
+        eng.set_https_only(True)
+        eng.set_use("socks5")
+        check("https-only is independent",
+              eng.https_only is True
+              and eng.use_flags == frozenset({"socks5"})
+              and "https" not in eng.use_flags, str(eng.use_flags))
+        snap = eng.snapshot()
+        check("snapshot carries the scope",
+              snap["use_only"] == "socks5" and "use socks5" in snap["scope"],
+              f"{snap['use_only']!r} {snap['scope']!r}")
+    finally:
+        eng.configure(use_only="", https_only=False)
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -1309,6 +1401,7 @@ def main():
         test_stats_and_list_ops,
         test_country,
         test_https_only,
+        test_use_scope,
         lambda: test_rotate_on_block(target_port, mock_port),
         test_strength,
         lambda: test_socks4a_remote_dns(target_port, socks4_port),

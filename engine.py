@@ -69,6 +69,7 @@ DEFAULTS = {
     "probe_connect": True,     # also test HTTPS (CONNECT) tunnel support
     "country": "",             # exit country (ISO 3166-1 alpha-2), "" = any
     "https_only": False,       # only use upstreams that can tunnel HTTPS
+    "use_only": "",            # routing scope: any of use_flags, "" = no limit
     "rotate_on": "403,429,999",  # origin statuses that rotate onto another exit
     # plain-text proxy list URLs to auto-reload while running ("" = off);
     # free proxies die constantly, so the pool restocks itself
@@ -83,6 +84,8 @@ MAX_HEADER_BYTES = 65536
 RELAY_CHUNK = 65536
 BUFFER_CAP = 5000             # log lines kept in memory for the GUI
 STALE_AFTER = 10              # failed probes before a list refresh drops an entry
+FAST_MS = 300.0               # latency at or below this counts as "fast"
+USE_FLAGS = ("http", "socks4", "socks5", "strong", "fast")  # routing scope
 
 # upstream protocols we can speak
 PROTO_ALIASES = {
@@ -417,6 +420,27 @@ def _validate_refresh_interval(value) -> int:
     return secs
 
 
+def _validate_use_only(value) -> str:
+    """Normalise `use_only` ("socks5,strong") or raise ValueError.
+
+    Only the known routing flags are accepted; they are deduplicated and
+    emitted in canonical `USE_FLAGS` order, and empty means "no
+    restriction".  HTTPS tunnel scope is deliberately not one of them --
+    that is `https_only`'s separate switch.
+    """
+    parts = [tok for tok in re.split(r"[,\s]+",
+                                     str(value or "").strip().lower()) if tok]
+    for tok in parts:
+        if tok not in USE_FLAGS:
+            hint = (" — HTTPS tunnel scope is the separate https-only "
+                    "switch" if tok == "https" else "")
+            raise ValueError(
+                f"unknown routing flag {tok!r}{hint}; use any of "
+                + ", ".join(USE_FLAGS))
+    picked = set(parts)
+    return ",".join(flag for flag in USE_FLAGS if flag in picked)
+
+
 def _scheme_hint(url: str) -> str:
     """Protocol prefix for a list URL whose name says what it serves.
 
@@ -749,6 +773,11 @@ class RotatingProxy:
                 self.settings.get("refresh_interval"))
         except ValueError:
             self.settings["refresh_interval"] = DEFAULTS["refresh_interval"]
+        try:
+            self.settings["use_only"] = _validate_use_only(
+                self.settings.get("use_only"))
+        except ValueError:
+            self.settings["use_only"] = ""   # bad scope = no restriction
 
         self._log_cb = logger
         self._lock = threading.RLock()
@@ -809,7 +838,8 @@ class RotatingProxy:
             # silently disabled rotation later on
             updates = dict(updates)
             updates["rotate_on"] = _validate_rotate_on(updates["rotate_on"])
-        if "refresh_url" in updates or "refresh_interval" in updates:
+        if ("refresh_url" in updates or "refresh_interval" in updates
+                or "use_only" in updates):
             updates = dict(updates)
             if "refresh_url" in updates:
                 updates["refresh_url"] = _validate_refresh_url(
@@ -817,6 +847,9 @@ class RotatingProxy:
             if "refresh_interval" in updates:
                 updates["refresh_interval"] = _validate_refresh_interval(
                     updates["refresh_interval"])
+            if "use_only" in updates:
+                updates["use_only"] = _validate_use_only(
+                    updates["use_only"])
         self.settings.update(updates)
         return dict(self.settings)
 
@@ -910,6 +943,33 @@ class RotatingProxy:
         else:
             self.log("info", "upstream selection: any upstream "
                              "(HTTP and HTTPS)")
+        return new
+
+    @property
+    def use_flags(self) -> frozenset:
+        """Routing-scope flags (see `USE_FLAGS`); empty when unrestricted."""
+        return frozenset(tok for tok in
+                         str(self.settings.get("use_only") or "").split(",")
+                         if tok)
+
+    def set_use(self, value) -> str:
+        """Restrict upstream selection to the given routing flags ("" = any).
+
+        The third of the `set_country` / `set_https_only` family: safe to
+        call while running, because it only changes candidate selection,
+        never the listener.  Flags live in `use_only` as a comma list
+        ("socks5,strong"); the HTTPS tunnel scope stays with its own
+        `https_only` switch.
+        """
+        with self._lock:
+            new = _validate_use_only(value)
+            changed = new != str(self.settings.get("use_only") or "")
+            self.settings["use_only"] = new
+        if changed:
+            if new:
+                self.log("info", f"upstream selection: only {new}")
+            else:
+                self.log("info", "upstream selection: any kind of upstream")
         return new
 
     # -- proxy list -------------------------------------------------------
@@ -1131,6 +1191,21 @@ class RotatingProxy:
                 pool = [n for n in pool if n.connect_ok is not False]
                 if not pool:
                     scope_empty.append("https")
+            flags = self.use_flags
+            types = flags & {"http", "socks4", "socks5"}
+            if types:
+                pool = [n for n in pool if n.proto in types]
+                if not pool:
+                    scope_empty.append("/".join(sorted(types)))
+            if "strong" in flags:
+                pool = [n for n in pool if n.strength == "Strong"]
+                if not pool:
+                    scope_empty.append("strong")
+            if "fast" in flags:
+                pool = [n for n in pool
+                        if n.latency is not None and n.latency <= FAST_MS]
+                if not pool:
+                    scope_empty.append("fast")
             if not pool:
                 if scope_empty:
                     self._warn_scope(*scope_empty)
@@ -1916,9 +1991,12 @@ class RotatingProxy:
         for item in what:
             if item == "https":
                 parts.append("no upstream here can tunnel HTTPS")
-            else:
+            elif len(item) == 2 and item.isalpha():
                 name = self._country_name(item)
                 parts.append(f"no usable upstream in {name or item} ({item})")
+            else:
+                parts.append(f"no upstream matches the {item} "
+                             "routing filter")
         self.log("warn", f"{' and '.join(parts)} — "
                          "requests will 502 until one comes back")
 
@@ -1931,6 +2009,10 @@ class RotatingProxy:
             bits.append(f"exit {name or code} ({code})")
         if self.https_only:
             bits.append("HTTPS-capable only")
+        flags = self.use_flags
+        if flags:
+            ordered = [f for f in USE_FLAGS if f in flags]
+            bits.append(f"use {','.join(ordered)}")
         return " · ".join(bits)
 
     # -- reporting --------------------------------------------------------
@@ -1956,6 +2038,7 @@ class RotatingProxy:
                 total=len(self._nodes),
                 country=str(self.settings.get("country") or "").upper(),
                 https_only=bool(self.settings.get("https_only")),
+                use_only=str(self.settings.get("use_only") or ""),
                 scope=self._scope_note(),
                 pool_countries=countries,
                 pool_alive=counts["alive"],

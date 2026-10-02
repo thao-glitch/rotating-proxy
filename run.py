@@ -22,7 +22,7 @@ import signal
 import sys
 import time
 
-from engine import DEFAULTS, RotatingProxy
+from engine import DEFAULTS, FAST_MS, RotatingProxy, USE_FLAGS
 from proxylist import PROXY_LIST
 
 
@@ -84,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refresh-interval", type=int,
                    default=DEFAULTS["refresh_interval"],
                    help="seconds between automatic proxy list refreshes")
+    p.add_argument("--use", metavar="FLAGS",
+                   default=DEFAULTS["use_only"],
+                   help=f"comma-separated routing scope: "
+                        f"{', '.join(USE_FLAGS)} "
+                        "(empty = every upstream); HTTPS tunnels have "
+                        "their own --https-only")
     return p
 
 
@@ -106,6 +112,15 @@ def run_check(args) -> int:
                             if n["cc"] == want])
         print(f"Exit country: {want} "
               f"({len(engine.proxies())} upstreams)")
+    try:
+        engine.configure(use_only=args.use)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if engine.use_flags:
+        print("Routing scope: "
+              + ",".join(f for f in USE_FLAGS if f in engine.use_flags)
+              + " — only these will be reported")
     https_only = bool(args.https_only)
     if https_only:
         print("HTTPS-only: will report the upstreams that can tunnel")
@@ -130,6 +145,26 @@ def run_check(args) -> int:
         # the probe has now decided True/False for everything it reached
         nodes = [n for n in nodes if n["connect_ok"] is True]
         print(f"Showing the {len(nodes)} that can open an HTTPS tunnel")
+    use = engine.use_flags
+    if use:
+        # strength and latency only exist after the probe, so this filter
+        # runs late, exactly like the https-only one above
+        types = use & {"http", "socks4", "socks5"}
+
+        def in_scope(n):
+            if types and n["proto"] not in types:
+                return False
+            if "strong" in use and n.get("strength") != "Strong":
+                return False
+            if "fast" in use:
+                latency = n.get("latency")
+                if latency is None or latency > FAST_MS:
+                    return False
+            return True
+
+        nodes = [n for n in nodes if in_scope(n)]
+        print(f"Showing the {len(nodes)} in the routing scope "
+              f"({', '.join(f for f in USE_FLAGS if f in use)})")
     width = max((len(n["label"]) for n in nodes), default=10)
     for n in nodes:
         if n["status"] == "alive":
@@ -177,6 +212,12 @@ def run_cli(args) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+    if args.use:
+        try:
+            engine.configure(use_only=args.use)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     try:
         engine.start()
@@ -188,9 +229,13 @@ def run_cli(args) -> int:
     scope = (f"  exit:   {engine.country}\n" if engine.country else "")
     tunnel = ("  https:  only upstreams that can tunnel\n"
               if engine.https_only else "")
+    route = ""
+    if engine.use_flags:
+        used = ",".join(f for f in USE_FLAGS if f in engine.use_flags)
+        route = f"  use:    {used}\n"
     print(f"\n  proxy:  http://{engine.host}:{engine.port}\n"
           f"  pool:   {len(engine.proxies())} upstreams configured\n"
-          f"{scope}{tunnel}"
+          f"{scope}{tunnel}{route}"
           f"  press Ctrl+C to stop\n")
     previous = 0
     try:
@@ -232,7 +277,8 @@ def run_gui(args) -> int:
                  "check_interval": args.check_interval,
                  "max_retries": args.max_retries,
                  "refresh_url": args.refresh_url,
-                 "refresh_interval": args.refresh_interval}
+                 "refresh_interval": args.refresh_interval,
+                 "use_only": args.use}
     for key, value in overrides.items():
         if value != DEFAULTS[key]:
             try:

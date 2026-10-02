@@ -124,6 +124,8 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
                        (ISO code or name, e.g. `DE` or `Germany`)
 --https-only           only use upstreams that can tunnel HTTPS
 --no-https-only        drop that restriction again
+--use FLAGS            comma-separated routing scope from http, socks4,
+                       socks5, strong, fast (empty = every upstream)
 --rotate-on CODES      comma-separated statuses that make a plain-HTTP
                        request retry through a different exit because
                        this one's IP was refused (default 403,429,999;
@@ -139,10 +141,10 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
 --no-autostart         open the panel without starting the proxy
 ```
 
-Both scope flags work in all three modes: they override whatever the state
-file had, scope the panel's picker, the `--cli` pool, and the set `--check`
-probes. Exit codes from `--check`: `0` if at least one upstream is alive (and,
-with `--https-only`, can tunnel), `1` otherwise.
+Both scope mechanisms work in all three modes: they override whatever the
+state file had, scope the panel's picker, the `--cli` pool, and the set
+`--check` probes. Exit codes from `--check`: `0` if at least one upstream is
+alive (and, with `--https-only` or `--use`, matches the scope), `1` otherwise.
 
 ## Pointing apps, browsers and the whole system at it
 
@@ -245,8 +247,8 @@ tally ends with `· exit DE`.
 ## Routing through HTTPS-capable upstreams
 
 About three quarters of free proxies will refuse an HTTPS `CONNECT` tunnel,
-which is what every `https://` site needs. The **HTTPS only** checkbox, right
-next to *Exit via*, keeps rotation on upstreams that can actually tunnel:
+which is what every `https://` site needs. The **HTTPS** chip in the pool's
+*Use* row keeps rotation on upstreams that can actually tunnel:
 
 * **It knows** — a health check reports each node's tunnel support
   (`probe_connect`, on by default); a node that proved it *cannot* tunnel is
@@ -278,6 +280,35 @@ Missing the database? Install it and restart the panel:
 
 ```bash
 sudo apt install geoip-database python3-geoip
+```
+
+## Picking what the engine may use
+
+The pool toolbar's **Use** row — `HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`,
+`Strong`, `Fast` — scopes *which proxies the engine actually routes
+through*. The dropdowns and the filter box only decide what the table
+*shows*; these chips decide what carries traffic:
+
+* **Protocol chips** (`HTTP`, `SOCKS4`, `SOCKS5`) — click one to use only
+  that protocol, click several to allow several, and clear them all to
+  allow every kind of upstream again.
+* **HTTPS** — the same switch as `--https-only` above, in chip form.
+* **Strong / Fast** — only upstreams in the Strong strength tier, resp.
+  with a measured latency of at most 300 ms (`fast`).
+* **They stack** with the exit country and with each other, work while
+  the proxy is running, and save to `proxy_state.json` the moment you
+  click. The log confirms the scope: `upstream selection: only
+  socks5,strong`.
+* **It fails honestly** — a scope nothing matches warns like the country
+  scope does (`no upstream matches the strong routing filter — requests
+  will 502 until one comes back`) instead of silently routing anywhere,
+  and the status bar shows `Routing scope: socks5, strong` while active.
+* From the command line: `python3 run.py --use socks5,strong` in every
+  mode; an unknown flag is rejected up front with the list of valid ones.
+
+```bash
+python3 run.py --use socks5            # only SOCKS5 exits
+python3 run.py --use strong,fast       # only quick, proven exits
 ```
 
 ## Passing sites that block proxies
@@ -377,8 +408,9 @@ full-width cards underneath.
   served, active connections, failures, pool health, uptime and traffic.
 * **Upstream pool** — sortable table (`Proxy`, `Type`, `Country`, `Status`,
   `Latency`, `Last check`, `Served`, `Last error`) with the **Exit via**
-  country picker, the **Region** dropdown and the **HTTPS only** routing
-  checkbox in its toolbar. The *Status* cell shows the strength badge
+  country picker, the **Use** row of routing chips (`HTTP`, `HTTPS`,
+  `SOCKS4`, `SOCKS5`, `Strong`, `Fast`) and the **Region** dropdown in its
+  toolbar. The *Status* cell shows the strength badge
   (`Alive · Strong`), addresses sort numerically (`10.0.0.2` ahead of
   `10.0.0.10`) in every order — and in the default status view, equal ranks
   tiebreak by strength, then by address. Type `socks4` in the filter box to
@@ -438,7 +470,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 442 checks
+That is the whole procedure: the `release` workflow runs the 473 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -454,12 +486,12 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 192 checks
-xvfb-run -a python3 test_gui.py        # 135 checks (needs a display or Xvfb)
+python3 test_engine.py                 # 207 checks
+xvfb-run -a python3 test_gui.py        # 151 checks (needs a display or Xvfb)
 python3 test_proxyctl.py               # 115 checks
 ```
 
-442 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+473 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
 country or HTTPS-only flag from a real session can never leak into the checks.
 
