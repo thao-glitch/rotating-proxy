@@ -76,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "request retry through a different exit because this "
                         "one's IP was refused (default: %(default)s); "
                         "empty switches the rotation off")
+    p.add_argument("--refresh-url", metavar="URLS",
+                   default=DEFAULTS["refresh_url"],
+                   help="comma-separated plain-text proxy list URLs to "
+                        "auto-reload into the pool while running "
+                        "(default: %(default)s; empty disables)")
+    p.add_argument("--refresh-interval", type=int,
+                   default=DEFAULTS["refresh_interval"],
+                   help="seconds between automatic proxy list refreshes")
     return p
 
 
@@ -144,7 +152,9 @@ def run_cli(args) -> int:
     settings = dict(host=args.host, port=args.port,
                     check_interval=args.check_interval,
                     max_retries=args.max_retries,
-                    rotate_on=args.rotate_on)
+                    rotate_on=args.rotate_on,
+                    refresh_url=args.refresh_url,
+                    refresh_interval=args.refresh_interval)
     engine = RotatingProxy(proxies=args.proxy or list(PROXY_LIST), **settings)
     rank = {"debug": 0, "info": 1, "warn": 2, "error": 3}
     threshold = rank[args.log_level]
@@ -220,7 +230,9 @@ def run_gui(args) -> int:
     # explicit command-line flags win over whatever the state file had
     overrides = {"host": args.host, "port": args.port,
                  "check_interval": args.check_interval,
-                 "max_retries": args.max_retries}
+                 "max_retries": args.max_retries,
+                 "refresh_url": args.refresh_url,
+                 "refresh_interval": args.refresh_interval}
     for key, value in overrides.items():
         if value != DEFAULTS[key]:
             try:

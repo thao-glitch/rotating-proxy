@@ -17,6 +17,9 @@ in front of it.
 * **Every upstream is categorised** — a rolling score (Strong / Good / Weak /
   New), latency with a *Fast* filter, a world *Region* filter, HTTPS support
   and live country counts, all sortable and filterable in the pool table
+* **The pool restocks itself**: fresh proxies are pulled from plain-text
+  lists every few hours, long-dead entries are dropped, and *Proxy →
+  Refresh proxy list now* does it immediately
 
 ```
 $ python3 run.py            # opens the desktop panel
@@ -69,14 +72,14 @@ Worth knowing:
 | File | What it is |
 | --- | --- |
 | `run.py` | entry point and command-line arguments |
-| `engine.py` | the proxy core: listener, rotation, failover, health checks |
+| `engine.py` | the proxy core: listener, rotation, failover, health checks, list auto-refresh |
 | `gui.py` | the Tkinter dashboard |
 | `proxyctl.py` | `./proxyctl` — points the shell, Firefox and browsers at the proxy |
 | `appstate.py` | where `proxy_state.json` lives (next to the scripts in a checkout, in the user's config directory once installed) |
 | `geodb.py` | offline IP → country lookup (GeoLite Country via `python3-geoip`) |
 | `proxylist.py` | the upstream list (300 HTTP + 300 SOCKS4) |
-| `test_engine.py` | 172 engine checks (local target + mock HTTP/SOCKS upstreams) |
-| `test_gui.py` | 132 dashboard checks (headless, run under `xvfb-run`) |
+| `test_engine.py` | 192 engine checks (local target + mock HTTP/SOCKS upstreams) |
+| `test_gui.py` | 135 dashboard checks (headless, run under `xvfb-run`) |
 | `test_proxyctl.py` | 115 `proxyctl` checks (runs entirely in a throwaway HOME) |
 | `packaging/` | PyInstaller spec, the installer sources for every platform (Inno Setup, deb, AppImage, pkg, APK, Termux script) and the generated icons |
 | `.github/workflows/release.yml` | runs the tests and publishes all installers when a `v*` tag is pushed |
@@ -125,6 +128,11 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
                        request retry through a different exit because
                        this one's IP was refused (default 403,429,999;
                        empty switches the rotation off)
+--refresh-url URLS     comma-separated plain-text proxy list URLs to
+                       auto-reload into the pool while running (empty
+                       disables the refresh)
+--refresh-interval N   seconds between automatic list refreshes
+                       (default 21600 = 6 h, minimum 60)
 --log-level LEVEL      debug | info | warn | error   (--cli mode)
 --cli                  run headless, print the log
 --check                probe the whole pool once and exit
@@ -327,6 +335,37 @@ Every upstream carries more than alive/dead:
   `Type` sorts/groups HTTP vs SOCKS4 vs SOCKS5, and each row's health sweep
   keeps `Last check` / `Last error` current.
 
+## Keeping the pool stocked
+
+Free proxies die constantly — a static list is dead within weeks, so the
+engine reloads fresh ones from plain-text lists **while it runs**:
+
+* **Automatic** — every `refresh_interval` (default 6 hours) it fetches the
+  configured URLs, merges everything new (deduplicated; comments, junk rows
+  and duplicate addresses ignored), drops long-dead entries in the same pass,
+  and health-checks the additions straight away. Each pass is logged:
+  `proxy list refreshed (interval): +132 new, 18 stale dropped (731
+  configured)`.
+* **Built-in sources** — two well-maintained public lists (HTTP and SOCKS5)
+  ship as the default, so a fresh install restocks itself out of the box.
+  Point it at your own lists with *Refresh list from URL(s)* in *Settings*
+  or `--refresh-url` on the command line (comma-separated; `""` switches the
+  feature off). A URL whose name contains `socks5`/`socks4` tags bare
+  `host:port` lines with that scheme; everything else is read as HTTP.
+* **Bounded growth** — an entry that stays dead for 10 consecutive probes is
+  pruned on the next refresh, so the pool neither stagnates nor grows
+  without bound. A later list may re-add it; it then starts over as *New*
+  and earns its place again.
+* **Manual** — *Proxy → Refresh proxy list now* pulls immediately, without
+  waiting for the interval.
+* **Failure-proof** — a source that is offline or gone is logged and
+  retried next round; it never takes the proxy down or kills the refresh
+  loop. Downloads are capped at 4 MB.
+
+Rows that carry credentials (`user:pass@host:port` or
+`host:port:user:pass`) are skipped: the engine does not authenticate to
+upstreams, so they could only ever fail.
+
 ## The dashboard
 
 A light, GoLogin-style panel: a left sidebar rail for status and actions,
@@ -349,8 +388,9 @@ full-width cards underneath.
 * **Log** — timestamped engine log with level filtering and colour.
 * **Traffic** — rolling sparkline of requests and concurrent connections.
 * **Settings** — listen address, health-check interval, retries, timeouts,
-  parallel probes, whether to also probe HTTPS tunnel support, and the
-  *Rotate exit on status* list behind the block-rotation feature.
+  parallel probes, whether to also probe HTTPS tunnel support, the
+  *Rotate exit on status* list behind the block-rotation feature, and the
+  list-refresh URL(s)/interval behind the auto-restock feature.
 * **Apps** — the three switches described above, with their live status and a
   one-click *Point everything at this proxy* / *Take everything off*.
 
@@ -388,7 +428,8 @@ certificate chain"*). That is the upstream, not this proxy — for a quick test
 A tunnel can also be dropped the moment it is established (curl's
 *"TLS connect error / unexpected eof"*): the engine evicts that node, and the
 next request rotates onto another one — expect an occasional retry on a free
-pool.
+pool. See *Keeping the pool stocked* above: the auto-refresh keeps replacing
+the dead ones for you.
 
 ## Cutting a release
 
@@ -397,7 +438,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 419 checks
+That is the whole procedure: the `release` workflow runs the 442 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -413,12 +454,12 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 172 checks
-xvfb-run -a python3 test_gui.py        # 132 checks (needs a display or Xvfb)
+python3 test_engine.py                 # 192 checks
+xvfb-run -a python3 test_gui.py        # 135 checks (needs a display or Xvfb)
 python3 test_proxyctl.py               # 115 checks
 ```
 
-419 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+442 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
 country or HTTPS-only flag from a real session can never leak into the checks.
 

@@ -47,6 +47,7 @@ import socket
 import struct
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from proxylist import PROXY_LIST
@@ -69,11 +70,19 @@ DEFAULTS = {
     "country": "",             # exit country (ISO 3166-1 alpha-2), "" = any
     "https_only": False,       # only use upstreams that can tunnel HTTPS
     "rotate_on": "403,429,999",  # origin statuses that rotate onto another exit
+    # plain-text proxy list URLs to auto-reload while running ("" = off);
+    # free proxies die constantly, so the pool restocks itself
+    "refresh_url": ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/"
+                    "master/http.txt,"
+                    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/"
+                    "master/socks5.txt"),
+    "refresh_interval": 21600,   # seconds between list refreshes (6 h)
 }
 
 MAX_HEADER_BYTES = 65536
 RELAY_CHUNK = 65536
 BUFFER_CAP = 5000             # log lines kept in memory for the GUI
+STALE_AFTER = 10              # failed probes before a list refresh drops an entry
 
 # upstream protocols we can speak
 PROTO_ALIASES = {
@@ -376,6 +385,51 @@ def _validate_rotate_on(value) -> str:
                 f"(e.g. 403,429), got {value!r}")
     return ",".join(tok.strip() for tok in text.replace(";", ",").split(",")
                     if tok.strip())
+
+
+def _validate_refresh_url(value) -> str:
+    """Normalise the comma/whitespace-separated refresh URLs ("" = off).
+
+    Accepts any mix of commas, spaces and newlines between the URLs so the
+    setting can be pasted straight from a multi-line note.  Raises for
+    anything that is not http(s) -- a typo must surface as a dialog, not as
+    a silently broken auto-refresh.
+    """
+    parts = [chunk for chunk in re.split(r"[,\s]+", str(value or "").strip())
+             if chunk]
+    for chunk in parts:
+        if not re.match(r"^https?://", chunk, re.I):
+            raise ValueError(
+                f"refresh URL must start with http:// or https://, "
+                f"got {chunk!r}")
+    return ", ".join(parts)
+
+
+def _validate_refresh_interval(value) -> int:
+    """Normalise `refresh_interval` (seconds) or raise ValueError."""
+    try:
+        secs = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"refresh interval must be a number of seconds, got {value!r}")
+    if secs < 60:
+        raise ValueError("refresh interval must be at least 60 seconds")
+    return secs
+
+
+def _scheme_hint(url: str) -> str:
+    """Protocol prefix for a list URL whose name says what it serves.
+
+    Public lists publish bare `host:port` lines regardless of protocol, so
+    `…/socks5.txt` is the only signal that those rows are SOCKS5.  Anything
+    else (http.txt, all.txt, a custom script) is treated as HTTP.
+    """
+    low = str(url).lower()
+    if "socks5" in low:
+        return "socks5://"
+    if "socks4" in low:
+        return "socks4://"
+    return ""
 
 
 # Strength tiers: an exponentially weighted success score per upstream, so
@@ -683,6 +737,18 @@ class RotatingProxy:
                 self.settings.get("rotate_on"))
         except ValueError:
             self.settings["rotate_on"] = DEFAULTS["rotate_on"]
+        # likewise a hand-edited list-refresh setting must degrade to
+        # "off" rather than break start-up
+        try:
+            self.settings["refresh_url"] = _validate_refresh_url(
+                self.settings.get("refresh_url"))
+        except ValueError:
+            self.settings["refresh_url"] = ""
+        try:
+            self.settings["refresh_interval"] = _validate_refresh_interval(
+                self.settings.get("refresh_interval"))
+        except ValueError:
+            self.settings["refresh_interval"] = DEFAULTS["refresh_interval"]
 
         self._log_cb = logger
         self._lock = threading.RLock()
@@ -694,6 +760,7 @@ class RotatingProxy:
         self._last_scope_warn = 0.0           # throttle for the empty-country log
         self._srv: socket.socket | None = None
         self._threads: list[threading.Thread] = []
+        self._refresh_thread: threading.Thread | None = None
         self._open_socks: set[socket.socket] = set()
 
         self.stats = {
@@ -706,6 +773,7 @@ class RotatingProxy:
             "bytes_out": 0,
             "started_at": 0.0,
             "last_check_at": 0.0,
+            "last_refresh_at": 0.0,
             "check_progress": (0, 0),
         }
 
@@ -741,6 +809,14 @@ class RotatingProxy:
             # silently disabled rotation later on
             updates = dict(updates)
             updates["rotate_on"] = _validate_rotate_on(updates["rotate_on"])
+        if "refresh_url" in updates or "refresh_interval" in updates:
+            updates = dict(updates)
+            if "refresh_url" in updates:
+                updates["refresh_url"] = _validate_refresh_url(
+                    updates["refresh_url"])
+            if "refresh_interval" in updates:
+                updates["refresh_interval"] = _validate_refresh_interval(
+                    updates["refresh_interval"])
         self.settings.update(updates)
         return dict(self.settings)
 
@@ -966,6 +1042,7 @@ class RotatingProxy:
         if probe_first:
             self.check_now(reason="startup")
         self.start_health_loop()
+        self.start_refresh_loop()
 
     def stop(self) -> None:
         if not self.running and self.stats["status"] != "starting":
@@ -1696,6 +1773,123 @@ class RotatingProxy:
             return
         t = threading.Thread(target=self._health_loop, name="health-loop",
                              daemon=True)
+        t.start()
+        self._threads.append(t)
+
+    # -- periodic list refresh -------------------------------------------
+    @property
+    def refresh_url(self) -> list[str]:
+        """Configured list-refresh sources ([] when the feature is off)."""
+        raw = str(self.settings.get("refresh_url") or "").strip()
+        return [u for u in re.split(r"[,\s]+", raw) if u]
+
+    def _fetch_list(self, url: str, timeout: float = 15.0) -> str:
+        """Download one plain-text proxy list (capped at 4 MB)."""
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "RotatingProxy/1.0 (list refresh)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(4 * 1024 * 1024 + 1)
+        if len(data) > 4 * 1024 * 1024:
+            raise OSError("list is larger than the 4 MB cap")
+        return data.decode("utf-8", "replace")
+
+    def _prune_stale(self) -> int:
+        """Drop dead entries that keep failing (used by `refresh_list`).
+
+        Free lists churn constantly: without this the pool would only ever
+        grow, collecting nodes that died weeks ago.  An entry is stale once
+        it is dead *and* has failed `STALE_AFTER` probes or requests in a
+        row; a single success resets the counter and revives it.  The next
+        refresh may re-add a dropped address -- it then starts fresh as
+        "New" and earns its place again.
+        """
+        with self._lock:
+            keep = [n for n in self._nodes
+                    if not (n.status == "dead"
+                            and n.failures >= STALE_AFTER)]
+            if not keep:
+                return 0               # never empty the pool outright
+            dropped = len(self._nodes) - len(keep)
+            if dropped:
+                self._nodes = keep
+        return dropped
+
+    def refresh_list(self, *, reason: str = "interval") -> tuple[int, int]:
+        """Fetch the configured lists and merge whatever is new.
+
+        Returns ``(added, total)``.  Fetch failures are logged, never
+        raised: a list source going away must not take the proxy down or
+        kill the refresh loop.  Long-dead entries are pruned in the same
+        pass so the pool neither stagnates nor grows without bound.  When
+        the engine is running, new upstreams are health-checked straight
+        away so they can serve instead of sitting "unverified" until the
+        next interval sweep.
+        """
+        urls = self.refresh_url
+        if not urls:
+            with self._lock:
+                return 0, len(self._nodes)
+        blobs: list[str] = []
+        dead = 0
+        for url in urls:
+            try:
+                text = self._fetch_list(url)
+            except Exception as exc:
+                dead += 1
+                self.log("warn", f"proxy list unreachable ({url}): {exc}")
+                continue
+            hint = _scheme_hint(url)
+            # public lists publish bare host:port lines; only the URL says
+            # whether they are SOCKS.  Rows carrying credentials are
+            # skipped -- the engine does not authenticate to upstreams, so
+            # they could only ever fail and churn through the pool.
+            lines = []
+            for line in text.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "@" in s:
+                    continue
+                if "://" not in s and hint:
+                    s = hint + s
+                lines.append(s)
+            blobs.append("\n".join(lines))
+        added = self.add_proxies("\n".join(blobs)) if blobs else 0
+        pruned = self._prune_stale()
+        with self._lock:
+            self.stats["last_refresh_at"] = time.time()
+            total = len(self._nodes)
+        if added or pruned:
+            self.log("info", f"proxy list refreshed ({reason}): "
+                             f"+{added} new, {pruned} stale dropped "
+                             f"({total} configured)")
+            if added and self.running:
+                self.check_now(reason="list refresh")
+        elif dead and dead == len(urls):
+            self.log("warn", "proxy list refresh: no source was reachable")
+        else:
+            self.log("info", f"proxy list refreshed ({reason}): "
+                             "no new upstreams")
+        return added, total
+
+    def _refresh_loop(self) -> None:
+        while not self._stop.wait(
+                max(60, int(self.settings.get("refresh_interval")
+                            or DEFAULTS["refresh_interval"]))):
+            if threading.current_thread() is not self._refresh_thread:
+                return                      # a newer start replaced us
+            try:
+                self.refresh_list(reason="interval")
+            except Exception as exc:        # the thread must never die
+                self.log("error", f"proxy list refresh failed: {exc}")
+
+    def start_refresh_loop(self) -> None:
+        """Reload the configured lists every `refresh_interval` seconds."""
+        if not self.refresh_url:
+            return
+        if any(t.name == "refresh-loop" for t in self._threads):
+            return
+        t = threading.Thread(target=self._refresh_loop,
+                             name="refresh-loop", daemon=True)
+        self._refresh_thread = t            # so a stale loop can spot us
         t.start()
         self._threads.append(t)
 

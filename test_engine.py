@@ -1156,6 +1156,122 @@ def test_expect_continue(target_port, mock_port):
         eng.stop()
 
 
+def test_list_refresh():
+    """Auto-reload of plain-text proxy lists (the "keep the pool stocked"
+    feature): fetch, parse, merge, tolerate dead sources, validate input."""
+    print("\nauto-refresh from proxy list URLs")
+    import http.server
+
+    http_list = (
+        "# comment line\n"
+        "192.0.2.10:8080\n"
+        "192.0.2.11:3128\n"
+        "192.0.2.10:8080\n"                      # duplicate
+        "garbage without a port\n"               # junk, skipped silently
+        "198.51.100.7:8080,203.0.113.9:9999\n"   # comma blob
+    )
+    socks_list = "203.0.113.50:1080\n203.0.113.51:1080\n"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = socks_list if "socks5" in self.path else http_list
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_a):               # keep the test output clean
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    logs: list = []
+    eng = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                        proxies=["192.0.2.99:8080"])
+    try:
+        eng.configure(refresh_url=f"{base}/http.txt, {base}/socks5.txt",
+                      refresh_interval=3600)
+        added, total = eng.refresh_list(reason="test")
+        check("fresh upstreams added", added == 6, f"added={added}")
+        labels = eng.proxies()
+        check("pool total after merge", total == 7 and len(labels) == 7,
+              f"total={total} labels={len(labels)}")
+        check("bare lines become HTTP",
+              "192.0.2.10:8080" in labels and "192.0.2.11:3128" in labels,
+              str(labels))
+        check("comma blob split into two",
+              "198.51.100.7:8080" in labels and "203.0.113.9:9999" in labels,
+              str(labels))
+        check("socks list inherits its scheme",
+              "socks5://203.0.113.50:1080" in labels
+              and "socks5://203.0.113.51:1080" in labels, str(labels))
+        check("comments, junk and dupes skipped",
+              len(labels) == 7 and all("garbage" not in l and "#" not in l
+                                       for l in labels), str(labels))
+        check("existing upstream kept", "192.0.2.99:8080" in labels)
+        check("refresh logged",
+              any("proxy list refreshed" in m for _, m in logs),
+              str(logs[-2:]))
+        check("snapshot records the refresh",
+              eng.snapshot()["last_refresh_at"] > 0)
+        added2, _ = eng.refresh_list()
+        check("second refresh is deduplicated", added2 == 0, f"{added2}")
+        check("no sweep while stopped", not eng.checking)
+
+        # long-dead entries are pruned by the next refresh pass
+        for label in ("192.0.2.10:8080", "192.0.2.11:3128"):
+            node = next(n for n in eng._nodes if n.label == label)
+            node.status, node.failures = "dead", 12
+        added_stale, total_stale = eng.refresh_list()
+        check("stale dead entries pruned",
+              added_stale == 0 and total_stale == 5,
+              f"{added_stale}/{total_stale}")
+        check("prune logged",
+              any("stale dropped" in m for _, m in logs[-2:]), str(logs[-1:]))
+
+        # an unreachable source is logged and never raised
+        eng.configure(refresh_url="http://127.0.0.1:1/list.txt")
+        added3, total3 = eng.refresh_list()
+        check("dead source tolerated",
+              added3 == 0 and total3 == 5, f"{added3}/{total3}")
+        check("dead source logged",
+              any("unreachable" in m for _, m in logs[-3:]), str(logs[-2:]))
+
+        # validation surfaces as ValueError, not a broken setting
+        rejected = False
+        try:
+            eng.configure(refresh_url="ftp://host/list.txt")
+        except ValueError:
+            rejected = True
+        check("non-http URL rejected", rejected)
+        rejected = False
+        try:
+            eng.configure(refresh_interval=30)
+        except ValueError:
+            rejected = True
+        check("interval under 60s rejected", rejected)
+
+        # the off switch, and the loop's guards
+        eng.configure(refresh_url="")
+        check("empty URL disables the feature",
+              eng.refresh_list() == (0, 5) and eng.refresh_url == [],
+              str(eng.refresh_list()))
+        eng.start_refresh_loop()
+        check("loop refuses to start without a URL",
+              not any(t.name == "refresh-loop" for t in eng._threads))
+        eng.configure(refresh_url=f"{base}/http.txt")
+        eng.start_refresh_loop()
+        check("loop starts with a URL",
+              any(t.name == "refresh-loop" for t in eng._threads))
+        eng._stop.set()                          # releases the parked loop
+    finally:
+        eng._stop.set()
+        httpd.shutdown()
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -1198,6 +1314,7 @@ def main():
         lambda: test_socks4a_remote_dns(target_port, socks4_port),
         test_header_hygiene,
         lambda: test_expect_continue(target_port, mock_port),
+        test_list_refresh,
         test_lifecycle,
     ]
 

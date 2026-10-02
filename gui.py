@@ -88,6 +88,8 @@ SETTINGS_SPEC = [
     ("health_workers", "Parallel health probes",   "int"),
     ("probe_connect",  "Also test HTTPS tunnels",  "bool"),
     ("rotate_on",      "Rotate exit on status",    "str"),
+    ("refresh_url",    "Refresh list from URL(s)", "str"),
+    ("refresh_interval", "Refresh list every (s)", "int"),
 ]
 
 # Real font specs -- Tk only honours a *single* name as a named font, so we
@@ -305,6 +307,8 @@ class ProxyGUI(tk.Tk):
         proxm.add_command(label="Stop", command=self._stop)
         proxm.add_separator()
         proxm.add_command(label="Check health now", command=self._check_now)
+        proxm.add_command(label="Refresh proxy list now",
+                          command=self._refresh_list_now)
         proxm.add_command(label="Settings…", command=self._open_settings)
         proxm.add_separator()
         proxm.add_command(label="Point apps at this proxy…",
@@ -703,6 +707,25 @@ class ProxyGUI(tk.Tk):
             return
         self.engine.check_now(reason="manual")
         self.status_var.set("Health check running…")
+
+    def _refresh_list_now(self):
+        """Pull the configured proxy lists right now (Proxy menu)."""
+        if not self.engine.refresh_url:
+            self.status_var.set("No refresh URL set — add one in Settings "
+                                "first")
+            return
+        result: dict[str, tuple] = {}
+
+        def work():
+            result["pair"] = self.engine.refresh_list(reason="manual")
+
+        def done():
+            added, total = result.get("pair", (0, 0))
+            self.status_var.set(f"Proxy list refreshed: +{added} new "
+                                f"({total} configured)")
+
+        self.status_var.set("Refreshing proxy list…")
+        self._run_async(work, on_done=done)
 
     # -------------------------------------------------------------- pool UI
     def _status_filter_ok(self, node: dict) -> bool:
@@ -1225,7 +1248,7 @@ class ProxyGUI(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Settings")
         win.configure(bg=BG)
-        win.geometry("430x455")
+        win.geometry("430x560")
         win.transient(self)
         win.grab_set()
         self.settings_win = win
@@ -1251,7 +1274,9 @@ class ProxyGUI(tk.Tk):
                 "The port change always requires a restart.\n"
                 "“Rotate exit on status” is a comma-separated list of the\n"
                 "statuses that make a request retry from another exit IP\n"
-                "(429/403 blocks; empty switches it off).")
+                "(429/403 blocks; empty switches it off).\n"
+                "“Refresh list from URL(s)” auto-reloads fresh proxies\n"
+                "from plain-text lists while running (empty switches off).")
         tk.Label(body, text=note, bg=BG, fg=MUTED, justify="left",
                  font=F["small"]).pack(anchor="w", pady=(12, 0))
 

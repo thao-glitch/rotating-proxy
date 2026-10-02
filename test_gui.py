@@ -348,6 +348,10 @@ def test_dialogs(app):
     win = app.settings_win
     check("settings opens", win is not None and win.winfo_exists())
     check("settings has 8 fields", len(win.winfo_children()) >= 1)
+    spec_keys = [k for k, _, _ in gui.SETTINGS_SPEC]
+    check("settings lists the list-refresh options",
+          "refresh_url" in spec_keys and "refresh_interval" in spec_keys,
+          str(spec_keys))
     win.destroy()
     pump(app, ticks=2)
 
@@ -442,6 +446,12 @@ def test_every_button(app):
               app.settings_win is not None and app.settings_win.winfo_exists())
         app.settings_win.destroy()
         pump(app, ticks=2)
+
+        app.engine.configure(refresh_url="")     # no network in tests
+        check("Proxy/Refresh list fires",
+              invoke("Proxy", "Refresh proxy list now"))
+        check("refresh without a URL points at Settings",
+              "Settings" in app.status_var.get(), app.status_var.get())
 
         check("Proxy/Point apps fires",
               invoke("Proxy", "Point apps at this proxy…"))
