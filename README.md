@@ -54,7 +54,7 @@ Worth knowing:
 * Manual Termux install, from inside Termux:
 
   ```bash
-  curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/rotating-proxy-install-termux.sh | bash
+  curl -fsSL https://github.com/thao-glitch/rotating-proxy/releases/latest/download/rotating-proxy-install-termux.sh | bash
   ```
 
 ## Files

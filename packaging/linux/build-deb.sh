@@ -63,7 +63,7 @@ install -m 644 "$ROOT/README.md" "$STAGE/usr/share/doc/$PKG/README.md"
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: Rotating Proxy
-Source: https://github.com/OWNER/REPO
+Source: https://github.com/thao-glitch/rotating-proxy
 
 Files: *
 Copyright: Rotating Proxy contributors
