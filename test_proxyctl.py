@@ -444,6 +444,26 @@ def test_status():
         code, out = run(proxyctl.status)
         check("status is repeatable", code == 1, out)
 
+        # -- exit scope, read from the state file the engine writes -----
+        check("unrestricted scope reads as anywhere",
+              "exit       anywhere" in out, out)
+        sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1,'
+                       ' "region": "North America", "country": "us",'
+                       ' "state": "California", "https_only": true,'
+                       ' "use_only": "strong,socks5"}}')
+        _, out = run(proxyctl.status)
+        check("status prints the cascade",
+              all(bit in out for bit in ("exit       region=North America",
+                                         "country=US", "state=California")),
+              out)
+        check("status prints the hard switches",
+              "HTTPS-only" in out and "use=strong,socks5" in out, out)
+        sb.write_state("{not json")
+        _, out = run(proxyctl.status)
+        check("unreadable state file reported honestly",
+              "unknown (no state file)" in out, out)
+        sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1}}')
+
 
 def test_cli():
     with Sandbox() as sb:

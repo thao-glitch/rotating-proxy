@@ -34,3 +34,19 @@ def state_file() -> Path:
                 / "proxy_state.json")
     base = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
     return base / APP_SLUG / "proxy_state.json"
+
+
+def data_dir() -> Path:
+    """Directory for bulky per-user data (the city/state geo database).
+
+    Deliberately *not* next to the scripts: the database is ~120 MB, and
+    dropping that into a checkout would invite an accidental commit.  From
+    an installed build it sits beside `proxy_state.json`; from a checkout
+    it goes to the user's config directory, the same place `proxyctl`
+    already keeps its files.
+    """
+    if not getattr(sys, "frozen", False):
+        base = Path(os.environ.get("XDG_CONFIG_HOME")
+                    or Path.home() / ".config")
+        return base / APP_SLUG
+    return state_file().parent

@@ -68,6 +68,8 @@ DEFAULTS = {
     "health_workers": 64,      # parallel probes during a sweep
     "probe_connect": True,     # also test HTTPS (CONNECT) tunnel support
     "country": "",             # exit country (ISO 3166-1 alpha-2), "" = any
+    "region": "",              # exit world area (Europe, Asia, …), "" = any
+    "state": "",               # exit state/province ("California"), "" = any
     "https_only": False,       # only use upstreams that can tunnel HTTPS
     "use_only": "",            # routing scope: any of use_flags, "" = no limit
     "rotate_on": "403,429,999",  # origin statuses that rotate onto another exit
@@ -156,6 +158,19 @@ def resolve_country(host: str, hint: str = "") -> tuple[str, str]:
     return "", ""
 
 
+def resolve_state(host: str) -> tuple[str, str, str]:
+    """``(state, state code, city)`` for an upstream address.
+
+    Needs the city database (`geodb.fetch_city_db()`); without it every
+    address resolves to ``("","","")`` and state selection simply has
+    nothing to pick from, exactly like a missing country database.
+    """
+    try:
+        return geodb.locate(host)
+    except Exception:                           # a broken file must not
+        return ("", "", "")                     # take the whole pool down
+
+
 # metadata columns that tell us what kind of upstream a row is
 _TYPE_KEYWORDS = {
     "socks4": "socks4", "socks4a": "socks4", "sock4": "socks4",
@@ -207,6 +222,28 @@ REGION_OF: dict[str, str] = {
 def region_of(cc: str) -> str:
     """"Europe" / "Asia" / … for an ISO country code, "" when unknown."""
     return REGION_OF.get(str(cc or "").strip().upper(), "")
+
+
+REGIONS: tuple[str, ...] = tuple(_REGION_GROUPS)
+
+_ANYTHING = ("", "any", "all", "anywhere", "worldwide", "-")
+
+
+def normalize_region(value) -> str:
+    """Canonical region name ("" = anywhere), or ValueError for junk.
+
+    Accepts the name in any casing ("europe"), so the panel, the command
+    line and a hand-edited state file all agree on one spelling -- which
+    matters because the name is what `_candidates` matches on.
+    """
+    text = str(value or "").strip()
+    if text.lower() in _ANYTHING:
+        return ""
+    for region in REGIONS:
+        if region.lower() == text.lower():
+            return region
+    raise ValueError(f"unknown region {value!r} -- pick one of "
+                     f"{', '.join(REGIONS)}")
 
 
 def _guess_cc(fields) -> str:
@@ -644,17 +681,22 @@ _PROBE_UA = (b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 class Node:
     """A configured upstream plus its latest observed health."""
 
-    __slots__ = ("host", "port", "proto", "cc", "country", "status", "latency",
-                 "last_check", "last_error", "failures", "hits", "connect_ok",
+    __slots__ = ("host", "port", "proto", "cc", "country", "state",
+                 "state_code", "city", "status", "latency", "last_check",
+                 "last_error", "failures", "hits", "connect_ok",
                  "score", "samples", "blocks")
 
     def __init__(self, host: str, port: int, proto: str = "http",
-                 cc: str = "", country: str = ""):
+                 cc: str = "", country: str = "", state: str = "",
+                 state_code: str = "", city: str = ""):
         self.host = host
         self.port = port
         self.proto = proto            # http | socks4 | socks5
         self.cc = cc                  # ISO 3166-1 alpha-2, "" when unknown
         self.country = country        # human name, "" when unknown
+        self.state = state            # state/province, "" when unknown
+        self.state_code = state_code  # ISO 3166-2 tail ("CA"), "" when unknown
+        self.city = city              # city, "" when unknown
         self.status = "unknown"      # unknown | checking | alive | dead
         self.latency: float | None = None
         self.last_check: float = 0.0
@@ -681,6 +723,13 @@ class Node:
         if self.country:
             return self.country
         return self.cc or "—"
+
+    @property
+    def state_label(self) -> str:
+        """What the State column shows: the name, the code, or "—"."""
+        if self.state:
+            return self.state
+        return self.state_code or "—"
 
     @property
     def region(self) -> str:
@@ -721,6 +770,10 @@ class Node:
             "cc": self.cc,
             "country": self.country,
             "country_label": self.country_label,
+            "state": self.state,
+            "state_code": self.state_code,
+            "state_label": self.state_label,
+            "city": self.city,
             "region": self.region,
             "status": self.status,
             "latency": self.latency,
@@ -753,6 +806,19 @@ class RotatingProxy:
         if code and (len(code) != 2 or not code.isalpha()):
             code = ""
         self.settings["country"] = code
+        # …and the same for the two newer scope levels: an unknown region
+        # name is dropped, and a region/country pair that contradicts each
+        # other (a hand-edited file) keeps the more specific of the two --
+        # otherwise the scope would match nothing and every request would
+        # 502 with no visible cause
+        try:
+            region = normalize_region(self.settings.get("region"))
+        except ValueError:
+            region = ""
+        if region and code and region_of(code) != region:
+            region = ""
+        self.settings["region"] = region
+        self.settings["state"] = str(self.settings.get("state") or "").strip()
         self.settings["https_only"] = bool(self.settings.get("https_only"))
         # a hand-edited state file must never break start-up: anything that
         # is not a status-code list falls back to the shipped default
@@ -787,6 +853,7 @@ class RotatingProxy:
         self._nodes: list[Node] = []
         self._cc_hints: dict[str, str] = {}   # label -> country from an import
         self._last_scope_warn = 0.0           # throttle for the empty-country log
+        self._last_fallback_warn = 0.0        # throttle for the soft-scope log
         self._srv: socket.socket | None = None
         self._threads: list[threading.Thread] = []
         self._refresh_thread: threading.Thread | None = None
@@ -839,7 +906,8 @@ class RotatingProxy:
             updates = dict(updates)
             updates["rotate_on"] = _validate_rotate_on(updates["rotate_on"])
         if ("refresh_url" in updates or "refresh_interval" in updates
-                or "use_only" in updates):
+                or "use_only" in updates or "region" in updates
+                or "state" in updates):
             updates = dict(updates)
             if "refresh_url" in updates:
                 updates["refresh_url"] = _validate_refresh_url(
@@ -850,6 +918,12 @@ class RotatingProxy:
             if "use_only" in updates:
                 updates["use_only"] = _validate_use_only(
                     updates["use_only"])
+            if "region" in updates:
+                # an unknown area must not survive into the state file --
+                # it would scope the pool to nothing on the next start
+                updates["region"] = normalize_region(updates["region"])
+            if "state" in updates:
+                updates["state"] = str(updates["state"] or "").strip()
         self.settings.update(updates)
         return dict(self.settings)
 
@@ -875,6 +949,7 @@ class RotatingProxy:
         if want in ("any", "all", "anywhere", "worldwide"):
             want = ""
         with self._lock:
+            dropped = ""
             if not want:
                 changed = bool(self.settings["country"])
                 self.settings["country"] = ""
@@ -887,10 +962,29 @@ class RotatingProxy:
                     raise ValueError(f"unknown country {value!r}")
                 if not any(n.cc == code for n in self._nodes):
                     raise ValueError(f"no upstreams configured for {code}")
+                region = str(self.settings.get("region") or "")
+                if region and region_of(code) != region:
+                    # the cascade offered this country from *inside* the
+                    # region, so picking it from outside would scope the
+                    # pool to nothing and stop all traffic
+                    raise ValueError(f"{self._country_name(code) or code} "
+                                     f"({code}) is not in {region}")
                 changed = self.settings["country"] != code
                 self.settings["country"] = code
+                state = str(self.settings.get("state") or "")
+                if changed and state and not any(
+                        n.cc == code and self._state_matches(n, state)
+                        for n in self._nodes):
+                    # the state belonged to the country we just left;
+                    # keeping it would narrow the pool to nothing
+                    self.settings["state"] = ""
+                    dropped = state
         if not changed:
             return self.country
+        if dropped:
+            self.log("info", f"exit state {dropped} is outside "
+                             f"{self._country_name(code) or code} ({code})"
+                             " — state cleared")
         if self.country:
             name = self._country_name(self.country)
             self.log("info", f"upstream selection restricted to "
@@ -898,6 +992,121 @@ class RotatingProxy:
         else:
             self.log("info", "upstream selection: any country")
         return self.country
+
+    # -- region / state: the two levels above a country -------------------
+    @property
+    def region(self) -> str:
+        """World area the pool is restricted to ("" = anywhere)."""
+        return str(self.settings.get("region") or "")
+
+    def set_region(self, value) -> str:
+        """Restrict upstream selection to one world area ("" = anywhere).
+
+        Same contract as `set_country`: callable while running, because it
+        only changes candidate selection.  The panel's cascade re-offers the
+        countries inside the region, so a country that no longer fits is
+        dropped here too -- keeping both would match nothing at all.
+        """
+        with self._lock:
+            region = normalize_region(value)
+            changed = region != str(self.settings.get("region") or "")
+            dropped = ""
+            if changed:
+                self.settings["region"] = region
+                country = str(self.settings.get("country") or "")
+                state = str(self.settings.get("state") or "")
+                if region and country and region_of(country) != region:
+                    dropped = country
+                    self.settings["country"] = ""
+                    self.settings["state"] = ""
+                elif region and state and not any(
+                        region_of(n.cc) == region
+                        and self._state_matches(n, state)
+                        for n in self._nodes):
+                    # a state picked without a country belonged to some
+                    # country: keep it only if the new region offers it too
+                    self.settings["state"] = ""
+            if not changed:
+                return self.region
+        if dropped:
+            self.log("info", f"exit region {self.region}: "
+                             f"{self._country_name(dropped) or dropped} "
+                             f"({dropped}) is outside it, scope cleared")
+        if self.region:
+            self.log("info", f"upstream selection restricted to {self.region}")
+        else:
+            self.log("info", "upstream selection: any region")
+        return self.region
+
+    @property
+    def state(self) -> str:
+        """State/province the pool is restricted to ("" = anywhere)."""
+        return str(self.settings.get("state") or "")
+
+    def set_state(self, value) -> str:
+        """Restrict upstream selection to one state/province ("" = anywhere).
+
+        Accepts the name ("California") or, where the database carries one,
+        the code ("CA").  Needs the city database: without it no upstream
+        has a state at all, so the choice cannot be made and says so instead
+        of silently routing anywhere.
+        """
+        want = str(value or "").strip()
+        if want.lower() in _ANYTHING:
+            want = ""
+        with self._lock:
+            if not want:
+                changed = bool(self.settings.get("state"))
+                self.settings["state"] = ""
+            else:
+                region = str(self.settings.get("region") or "")
+                country = str(self.settings.get("country") or "")
+                pool = [n for n in self._nodes
+                        if (not region or region_of(n.cc) == region)
+                        and (not country or n.cc == country)]
+                match = next((n for n in pool
+                              if self._state_matches(n, want)), None)
+                if match is None:
+                    if not any(n.state or n.state_code for n in self._nodes):
+                        raise ValueError(
+                            "no city/state data yet — download the city "
+                            "database in Settings (or run "
+                            "`python3 run.py --geo-fetch`) to pick states")
+                    where = f" in {self._country_name(country) or country}" \
+                        if country else ""
+                    raise ValueError(f"no upstreams in {value!r}{where}")
+                canonical = match.state or match.state_code
+                changed = canonical != str(self.settings.get("state") or "")
+                self.settings["state"] = canonical
+            if not changed:
+                return self.state
+        if self.state:
+            self.log("info", f"upstream selection restricted to "
+                             f"{self.state}"
+                             + (f" ({self.country})" if self.country else ""))
+        else:
+            self.log("info", "upstream selection: any state")
+        return self.state
+
+    @property
+    def exit_place(self) -> str:
+        """Geographic exit scope as one phrase ("" = anywhere).
+
+        `California, Germany (DE)` for a state, `Germany (DE)` for a
+        country, `Europe` for a bare region -- the wording the 502 note,
+        the log line, the panel's tally and `run.py`'s banner all share.
+        """
+        return self._place_label()
+
+    @property
+    def scope_fallback(self) -> list[str]:
+        """Soft preferences currently being ignored on purpose.
+
+        `["strong"]` when nothing in scope has proven itself yet and the
+        request is going out anyway -- the panel prints it next to the
+        tally so "falling back" is visible instead of silent.
+        """
+        return self._fallback_flags()
 
     def _country_name(self, code: str) -> str:
         with self._lock:
@@ -991,7 +1200,9 @@ class RotatingProxy:
                 continue
             seen.add(label)
             cc, name = resolve_country(host, self._cc_hints.get(label, ""))
-            nodes.append(Node(host, port, proto, cc, name))
+            state_name, state_code, city = resolve_state(host)
+            nodes.append(Node(host, port, proto, cc, name,
+                              state_name, state_code, city))
         with self._lock:
             # keep health for entries that survive the edit
             old = {n.label: n for n in self._nodes}
@@ -1159,6 +1370,68 @@ class RotatingProxy:
             self.stats["bytes_in"] += down
 
     # -- upstream selection ----------------------------------------------
+    @staticmethod
+    def _state_matches(node: "Node", want: str) -> bool:
+        """True when an upstream sits in the wanted state (name or code)."""
+        if node.state and node.state.lower() == want.lower():
+            return True
+        return bool(node.state_code) and node.state_code.upper() == want.upper()
+
+    def _apply_scope(self, pool: list[Node]) -> tuple[list[Node], list[str]]:
+        """Drop everything the *hard* scope excludes, naming what emptied it.
+
+        Region, country, state, HTTPS support and the protocol chips are
+        promises: an exit outside them is exactly what the user asked not to
+        have, so an empty survivor list means "no candidate", never "route
+        somewhere else".  Returns the survivors plus a tag per filter that
+        emptied the list -- those tags are what the warning reports.
+        """
+        tags: list[str] = []
+        region = str(self.settings.get("region") or "")
+        if region:
+            pool = [n for n in pool if region_of(n.cc) == region]
+            if not pool:
+                tags.append(f"region:{region}")
+        country = str(self.settings.get("country") or "")
+        if country:
+            pool = [n for n in pool if n.cc == country]
+            if not pool:
+                tags.append(country)
+        state = str(self.settings.get("state") or "")
+        if state:
+            pool = [n for n in pool if self._state_matches(n, state)]
+            if not pool:
+                tags.append(f"state:{state}")
+        if bool(self.settings.get("https_only")):
+            pool = [n for n in pool if n.connect_ok is not False]
+            if not pool:
+                tags.append("https")
+        types = self.use_flags & {"http", "socks4", "socks5"}
+        if types:
+            pool = [n for n in pool if n.proto in types]
+            if not pool:
+                tags.append("/".join(sorted(types)))
+        return pool, tags
+
+    def _fallback_flags(self) -> list[str]:
+        """Soft flags (`strong`, `fast`) with nobody alive to offer.
+
+        Reported in the snapshot so the panel can say out loud that it is
+        routing outside a quality preference instead of quietly doing it.
+        """
+        flags = self.use_flags & {"strong", "fast"}
+        if not flags:
+            return []
+        pool, _ = self._apply_scope(
+            [n for n in self._nodes if n.status == "alive"])
+        out = []
+        if "strong" in flags and not any(n.strength == "Strong" for n in pool):
+            out.append("strong")
+        if "fast" in flags and not any(
+                n.latency is not None and n.latency <= FAST_MS for n in pool):
+            out.append("fast")
+        return out
+
     def _candidates(self, *, connect: bool = False) -> list[Node]:
         """Pick the upstreams to try for this request, best odds first.
 
@@ -1169,47 +1442,41 @@ class RotatingProxy:
         front first: only about a quarter of free proxies will tunnel, and
         without this a single HTTPS request could burn all its retries on
         proxies that answer 407 to CONNECT.
+
+        The geographic scope (region / country / state), HTTPS support and
+        the protocol chips are applied strictly.  `strong` and `fast` are
+        *preferences*: when nothing in scope matches them the request still
+        goes out through the best exit that is there, with a warning --
+        refusing to route because no exit has proven itself fast yet is how
+        a pointed browser ends up with no internet at all.
         """
         with self._lock:
             pool = [n for n in self._nodes if n.status == "alive"]
             if not pool:
                 # nothing verified yet (or everything just died): last resort
                 pool = [n for n in self._nodes if n.status != "checking"]
-            country = str(self.settings.get("country") or "").upper()
-            https = bool(self.settings.get("https_only"))
-            scope_empty: list[str] = []
-            if country:
-                # hard scope: an exit in another country is exactly what the
-                # user asked not to have, so an empty scope yields no
-                # candidates rather than quietly routing elsewhere
-                pool = [n for n in pool if n.cc == country]
-                if not pool:
-                    scope_empty.append(country)
-            if https:
-                # same rule for capability: a node only stays in play unless
-                # a health check proved it cannot open a CONNECT tunnel
-                pool = [n for n in pool if n.connect_ok is not False]
-                if not pool:
-                    scope_empty.append("https")
-            flags = self.use_flags
-            types = flags & {"http", "socks4", "socks5"}
-            if types:
-                pool = [n for n in pool if n.proto in types]
-                if not pool:
-                    scope_empty.append("/".join(sorted(types)))
-            if "strong" in flags:
-                pool = [n for n in pool if n.strength == "Strong"]
-                if not pool:
-                    scope_empty.append("strong")
-            if "fast" in flags:
-                pool = [n for n in pool
-                        if n.latency is not None and n.latency <= FAST_MS]
-                if not pool:
-                    scope_empty.append("fast")
+            pool, scope_empty = self._apply_scope(pool)
             if not pool:
                 if scope_empty:
                     self._warn_scope(*scope_empty)
                 return []
+            flags = self.use_flags
+            soft: list[str] = []
+            if "strong" in flags:
+                matched = [n for n in pool if n.strength == "Strong"]
+                if matched:
+                    pool = matched
+                else:
+                    soft.append("strong")
+            if "fast" in flags:
+                matched = [n for n in pool
+                           if n.latency is not None and n.latency <= FAST_MS]
+                if matched:
+                    pool = matched
+                else:
+                    soft.append("fast")
+            if soft:
+                self._warn_fallback(*soft)
             if connect:
                 parts = ([n for n in pool if n.connect_ok is True],
                          [n for n in pool if n.connect_ok is None],
@@ -1810,10 +2077,32 @@ class RotatingProxy:
                             if n.status == "alive" and n.connect_ok)
                 strong = sum(1 for n in self._nodes if n.strength == "Strong")
                 code = str(self.settings.get("country") or "").upper()
+                region = str(self.settings.get("region") or "")
+                state = str(self.settings.get("state") or "")
                 https_only = bool(self.settings.get("https_only"))
                 scoped = [n for n in self._nodes if n.cc == code] if code else []
                 scoped_alive = sum(1 for n in scoped if n.status == "alive")
                 name = next((n.country for n in scoped if n.country), "")
+                region_line = state_line = ""
+                if region and not code:
+                    nodes = [n for n in self._nodes if region_of(n.cc) == region]
+                    region_line = (f" · {region}: "
+                                   f"{sum(1 for n in nodes if n.status == 'alive')}"
+                                   f" alive of {len(nodes)}")
+                if state:
+                    nodes = [n for n in self._nodes
+                             if self._state_matches(n, state)]
+                    state_line = (f" · {state}"
+                                  + (f" ({code})" if code else "")
+                                  + f": {sum(1 for n in nodes if n.status == 'alive')}"
+                                    f" alive of {len(nodes)}"
+                                  if nodes else
+                                  f" · no upstreams configured for {state}")
+                soft_line = ""
+                fallback = self._fallback_flags()
+                if fallback:
+                    soft_line = (f" · {'/'.join(fallback)}: none available, "
+                                 "falling back")
             msg = (f"health check done in {secs:.1f}s — "
                    f"{alive} alive ({https} tunnel HTTPS) of {total}"
                    f" · {strong} strong")
@@ -1822,6 +2111,7 @@ class RotatingProxy:
                         f"{scoped_alive} alive of {len(scoped)}"
                         if scoped else
                         f" · no upstreams configured for {name or code} ({code})")
+            msg += region_line + state_line + soft_line
             if https_only:
                 usable = sum(1 for n in self._nodes if n.connect_ok is not False)
                 msg += (f" · HTTPS-only: {usable} can tunnel of {total}"
@@ -1968,18 +2258,35 @@ class RotatingProxy:
         t.start()
         self._threads.append(t)
 
+    def _place_label(self) -> str:
+        """Geographic scope as one phrase, "" when there is no restriction.
+
+        `California, Germany (DE)` for a state, `Germany (DE)` for a
+        country, `Europe` for a bare region -- the same wording the 502
+        note, the log and the status bar all use.
+        """
+        region, code, state = self.region, self.country, self.state
+        parts = []
+        if state:
+            parts.append(state)
+        if code:
+            parts.append(f"{self._country_name(code) or code} ({code})")
+        elif region:
+            parts.append(region)
+        return ", ".join(parts)
+
     def _no_upstream_note(self) -> str:
         """Suffix explaining a "nothing worked" line when a scope is set."""
-        code = self.country
-        if not code and not self.https_only:
+        place = self._place_label()
+        if not place and not self.https_only:
             return ""
-        if code:
-            name = self._country_name(code)
-            note = f"restricted to {name or code} ({code})"
-            if self.https_only:
-                note += " and HTTPS-capable upstreams"
-            return f" [{note}]"
-        return " [restricted to HTTPS-capable upstreams]"
+        bits = []
+        if place:
+            bits.append(f"restricted to {place}")
+        if self.https_only:
+            bits.append(("HTTPS-capable upstreams" if place
+                         else "restricted to HTTPS-capable upstreams"))
+        return " [" + " and ".join(bits) + "]"
 
     def _warn_scope(self, *what: str) -> None:
         """Say once in a while that the chosen scope has nothing usable."""
@@ -1991,6 +2298,11 @@ class RotatingProxy:
         for item in what:
             if item == "https":
                 parts.append("no upstream here can tunnel HTTPS")
+            elif item.startswith("region:"):
+                parts.append(f"no upstream in {item.split(':', 1)[1]}")
+            elif item.startswith("state:"):
+                parts.append("no usable upstream in "
+                             f"{item.split(':', 1)[1]}")
             elif len(item) == 2 and item.isalpha():
                 name = self._country_name(item)
                 parts.append(f"no usable upstream in {name or item} ({item})")
@@ -2000,13 +2312,30 @@ class RotatingProxy:
         self.log("warn", f"{' and '.join(parts)} — "
                          "requests will 502 until one comes back")
 
+    def _warn_fallback(self, *flags: str) -> None:
+        """Say once in a while that a *quality* preference had nobody left.
+
+        Unlike `_warn_scope` this is not a failure: the request still goes
+        out, through the best exit inside the geographic scope.  Saying it
+        out loud keeps the promise honest without breaking the connection.
+        """
+        now = time.time()
+        if now - self._last_fallback_warn < 15:
+            return
+        self._last_fallback_warn = now
+        names = ", ".join(f"{flag}" for flag in flags)
+        where = self._place_label()
+        self.log("warn", f"no {names} upstream"
+                         + (f" in {where}" if where else "")
+                         + " right now — falling back to the next best "
+                           "exit in scope, requests keep working")
+
     def _scope_note(self) -> str:
         """Short "what selection is restricted to" phrase, "" when free."""
         bits = []
-        code = self.country
-        if code:
-            name = self._country_name(code)
-            bits.append(f"exit {name or code} ({code})")
+        place = self._place_label()
+        if place:
+            bits.append(f"exit {place}")
         if self.https_only:
             bits.append("HTTPS-capable only")
         flags = self.use_flags
@@ -2034,9 +2363,26 @@ class RotatingProxy:
                     entry["alive"] += 1
                 if not entry["name"] and n.country:
                     entry["name"] = n.country
+            # states on offer *inside* the current region/country -- what
+            # the panel's cascade offers in its third box
+            states: dict[str, int] = {}
+            region = str(self.settings.get("region") or "")
+            code = str(self.settings.get("country") or "")
+            for n in self._nodes:
+                if not n.state:
+                    continue
+                if region and region_of(n.cc) != region:
+                    continue
+                if code and n.cc != code:
+                    continue
+                states[n.state] = states.get(n.state, 0) + 1
             snap.update(
                 total=len(self._nodes),
                 country=str(self.settings.get("country") or "").upper(),
+                region=str(self.settings.get("region") or ""),
+                state=str(self.settings.get("state") or ""),
+                scope_fallback=self._fallback_flags(),
+                pool_states=states,
                 https_only=bool(self.settings.get("https_only")),
                 use_only=str(self.settings.get("use_only") or ""),
                 scope=self._scope_note(),

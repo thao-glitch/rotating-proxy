@@ -9,8 +9,10 @@ colour-coded status — while every feature of the engine stays reachable:
 
   * start / stop / restart the local proxy
   * live stats: served, active, failures, pool health, uptime, traffic
-  * pool table with per-upstream status, strength tier, latency, region,
-    hits and last error — filterable by status, region and free text
+  * pool table with per-upstream status, strength tier, latency, country,
+    state, hits and last error — filterable by status and free text
+  * exit cascade (Region → Country → State): where traffic leaves, and a
+    one-time download of the state/city database behind the last level
   * add / remove / import / export upstream proxies
   * manual + scheduled health checks with a progress indicator
   * colour-coded log with level filtering
@@ -195,12 +197,18 @@ class ProxyGUI(tk.Tk):
         self._sort = ("status", False)          # (column, descending)
         self._filter_var = tk.StringVar(value="")
         self._status_var = tk.StringVar(value="All")
-        self._region_var = tk.StringVar(value="All regions")
-        self._region_choices: tuple = ("All regions",)
+        # the exit cascade: Region -> Country -> State, each box re-offered
+        # from the level above (the engine clears what no longer fits)
+        self._region_var = tk.StringVar(value="Anywhere")
+        self._region_choices: tuple = ("Anywhere",)
         self._country_var = tk.StringVar(value="Anywhere")
         self._country_values: dict[str, str] = {"Anywhere": ""}
         self._country_choices: tuple = ()
         self._country_names: dict[str, str] = {}   # ISO code -> display name
+        self._state_var = tk.StringVar(value="Anywhere")
+        self._state_values: dict[str, str] = {"Anywhere": ""}
+        self._state_choices: tuple = ()
+        self._geo_busy = False
         self._https_var = tk.BooleanVar(value=False)
         self._level_var = tk.StringVar(value="Info & up")
         self._auto_scroll = tk.BooleanVar(value=True)
@@ -418,6 +426,19 @@ class ProxyGUI(tk.Tk):
         body = tk.Frame(self._main, bg=BG)
         body.pack(side="top", fill="both", expand=True, padx=16, pady=(0, 14))
 
+        # ---- the activity card underneath -------------------------------
+        # Packed *first*: Tk's packer hands out space in packing order while
+        # the body is shorter than everything asks for, so a card with a
+        # fixed height has to claim its rows before the table asks for its
+        # own. The pool is the flexible part (it scrolls) and takes the rest.
+        nb_card = tk.Frame(body, bg=PANEL, highlightbackground=BORDER,
+                           highlightthickness=1, height=215)
+        nb_card.pack(side="bottom", fill="x")
+        nb_card.pack_propagate(False)
+
+        self.notebook = ttk.Notebook(nb_card)
+        self.notebook.pack(fill="both", expand=True)
+
         # ---- the pool card ----------------------------------------------
         pool = tk.Frame(body, bg=PANEL, highlightbackground=BORDER,
                         highlightthickness=1)
@@ -433,14 +454,29 @@ class ProxyGUI(tk.Tk):
         self.btn_add = _btn(bar, "＋ Add proxies", self._open_add, "Accent")
         self.btn_add.pack(side="right", padx=(5, 0))
 
-        # ---- exit country: where traffic leaves, not just what we show ----
-        tk.Label(bar, text="Exit via", bg=PANEL_2, fg=MUTED,
-                 font=F["small"]).pack(side="left", padx=(16, 4))
+        # ---- exit via: Region -> Country -> State ------------------------
+        # Where traffic leaves, as a cascade: every box only offers what
+        # the one above it contains, and the table below stays a view of
+        # the *whole* pool (the scope is routing, not a display filter).
+        exitbar = tk.Frame(pool, bg=PANEL_2, padx=12, pady=5)
+        exitbar.pack(fill="x")
+        tk.Label(exitbar, text="Exit via", bg=PANEL_2, fg=MUTED,
+                 font=F["small"]).pack(side="left", padx=(0, 8))
+        self.region_combo = ttk.Combobox(
+            exitbar, textvariable=self._region_var, width=15,
+            state="readonly", values=list(self._region_choices))
+        self.region_combo.pack(side="left", padx=(0, 8))
+        self.region_combo.bind("<<ComboboxSelected>>", self._on_region_pick)
         self.country_combo = ttk.Combobox(
-            bar, textvariable=self._country_var, width=18, state="readonly",
-            values=["Anywhere"])
-        self.country_combo.pack(side="left")
+            exitbar, textvariable=self._country_var, width=18,
+            state="readonly", values=["Anywhere"])
+        self.country_combo.pack(side="left", padx=(0, 8))
         self.country_combo.bind("<<ComboboxSelected>>", self._on_country_pick)
+        self.state_combo = ttk.Combobox(
+            exitbar, textvariable=self._state_var, width=16,
+            state="readonly", values=["Anywhere"])
+        self.state_combo.pack(side="left")
+        self.state_combo.bind("<<ComboboxSelected>>", self._on_state_pick)
 
         # ---- routing scope: which proxies the engine may use at all ------
         usebar = tk.Frame(pool, bg=PANEL_2, padx=12, pady=5)
@@ -468,32 +504,25 @@ class ProxyGUI(tk.Tk):
                                      "Strong", "Fast"])
         combo.pack(side="left", padx=(0, 6))
         combo.bind("<<ComboboxSelected>>", lambda e: self._render_pool(force=True))
-        tk.Label(filt, text="Region", bg=PANEL_2, fg=MUTED).pack(side="left",
-                                                                 padx=(8, 4))
-        self.region_combo = ttk.Combobox(filt, textvariable=self._region_var,
-                                         width=15, state="readonly",
-                                         values=list(self._region_choices))
-        self.region_combo.pack(side="left")
-        self.region_combo.bind("<<ComboboxSelected>>",
-                               lambda e: self._render_pool(force=True))
         self.pool_count = tk.Label(filt, text="", bg=PANEL_2, fg=MUTED,
                                    anchor="e")
         self.pool_count.pack(side="right", padx=(10, 0))
 
-        cols = ("proxy", "kind", "country", "status", "latency", "checked",
-                "hits", "error")
+        cols = ("proxy", "kind", "country", "state", "status", "latency",
+                "checked", "hits", "error")
         self.tree = ttk.Treeview(pool, columns=cols, show="headings",
                                  selectmode="extended")
-        # widths sum to 656px -- checked against the real font metrics, so
+        # widths sum to 682px -- measured against the real font metrics, so
         # every heading and badge fits even at the window's minimum size
-        # (the proxy and error columns stretch to fill the rest)
-        headings = {"proxy": ("Proxy", 130, "w"), "kind": ("Type", 62, "center"),
-                    "country": ("Country", 68, "center"),
-                    "status": ("Status", 104, "center"),
-                    "latency": ("Latency", 66, "e"),
-                    "checked": ("Last check", 84, "center"),
-                    "hits": ("Served", 60, "e"),
-                    "error": ("Last error", 82, "w")}
+        # (the proxy and error columns stretch to fill whatever is left)
+        headings = {"proxy": ("Proxy", 94, "w"), "kind": ("Type", 62, "center"),
+                    "country": ("Country", 64, "center"),
+                    "state": ("State", 78, "center"),
+                    "status": ("Status", 98, "center"),
+                    "latency": ("Latency", 72, "e"),
+                    "checked": ("Last check", 82, "center"),
+                    "hits": ("Served", 58, "e"),
+                    "error": ("Last error", 74, "w")}
         for col, (title, width, anchor) in headings.items():
             self.tree.heading(col, text=title,
                               command=lambda c=col: self._sort_by(c))
@@ -522,14 +551,8 @@ class ProxyGUI(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
 
-        # ---- the activity card underneath -------------------------------
-        nb_card = tk.Frame(body, bg=PANEL, highlightbackground=BORDER,
-                           highlightthickness=1, height=215)
-        nb_card.pack(fill="x")
-        nb_card.pack_propagate(False)
-
-        self.notebook = ttk.Notebook(nb_card)
-        self.notebook.pack(fill="both", expand=True)
+        # the activity card itself is built and packed at the top of
+        # _build_body -- it has to claim its rows before the table asks
 
         log_tab = ttk.Frame(self.notebook, style="Panel.TFrame")
         self.notebook.add(log_tab, text="  Log  ")
@@ -588,6 +611,9 @@ class ProxyGUI(tk.Tk):
         self.add_win = None
         self.settings_win = None
         self.apps_win = None
+        # the Settings dialog's city-database row (created when it opens)
+        self.geo_status = None
+        self.geo_btn = None
 
     # -------------------------------------------------------------- state
     @staticmethod
@@ -707,6 +733,10 @@ class ProxyGUI(tk.Tk):
                 return
             if item[0] == "log":
                 self._append_log(*item[1:])
+            elif item[0] == "geo":
+                self._geo_progress(item[1])
+            elif item[0] == "geo-done":
+                self._geo_finished(item[1], item[2])
             elif item[0] == "op":
                 _, error, on_done = item
                 self._busy = False
@@ -812,21 +842,26 @@ class ProxyGUI(tk.Tk):
             return lambda n: (n.get("kind", ""), _ip_key(n["label"]))
         if column == "country":
             return lambda n: (n.get("cc") or "~", _ip_key(n["label"]))
+        if column == "state":
+            return lambda n: ((n.get("state") or n.get("state_code") or "~"),
+                              _ip_key(n["label"]))
         return lambda n: _ip_key(n["label"])   # proxy / fallback
 
     def _render_pool(self, force: bool = False):
         nodes = self.engine.nodes()
         needle = self._filter_var.get().strip().lower()
-        region = self._region_var.get()
+        # the table is a view of the *whole* pool: the exit cascade above
+        # narrows routing, never what is listed (a scope that hides rows
+        # makes it impossible to see what else is configured)
         visible = [n for n in nodes
                    if self._status_filter_ok(n)
-                   and (region in ("", "All regions")
-                        or region_of(n.get("cc", "")) == region)
                    and (not needle or needle in n["label"].lower()
                         or needle in n.get("kind", "").lower()
                         or needle in n.get("country", "").lower()
                         or needle in n.get("cc", "").lower()
                         or needle in n.get("region", "").lower()
+                        or needle in n.get("state", "").lower()
+                        or needle in n.get("city", "").lower()
                         or needle in n.get("strength", "").lower()
                         or needle in n["last_error"].lower())]
 
@@ -871,9 +906,13 @@ class ProxyGUI(tk.Tk):
             tally.append(f"{strong} strong")
         if fast:
             tally.append(f"{fast} fast")
-        code = self.engine.country
-        if code:
-            tally.append(f"exit {code}")
+        place = self.engine.exit_place
+        if place:
+            tally.append(f"exit {place}")
+        for flag in self.engine.scope_fallback:
+            # a quality preference nobody in scope can honour yet: said
+            # out loud, because the traffic is leaving somewhere else
+            tally.append(f"{flag} fallback")
         if self.engine.https_only:
             tally.append("HTTPS only")
         # at the window's minimum the filter row runs out of room: drop
@@ -910,14 +949,23 @@ class ProxyGUI(tk.Tk):
             self.tree.update_idletasks()
 
     def _refresh_countries(self, snap: dict):
-        """Rebuild the "Exit via" picker from the countries the pool has."""
+        """Rebuild the "Exit via" picker from the countries the pool has.
+
+        Only countries *inside the chosen region* are offered: the box
+        below must never be able to contradict the one above it -- a
+        country outside the region is refused by the engine, and offering
+        it just makes the panel look broken when the pick does nothing.
+        """
         scope = snap.get("pool_countries") or {}
+        region = str(snap.get("region") or "")
         choices = [("", "Anywhere")]
         for e in sorted(scope.values(),
                         key=lambda v: (-int(v.get("alive", 0)),
                                        -int(v.get("total", 0)),
                                        str(v.get("name") or v["cc"]).lower())):
             cc = e["cc"]
+            if region and region_of(cc) != region:
+                continue
             name = e.get("name") or cc
             choices.append((cc, f"{name} ({cc}) · "
                                 f"{e.get('alive', 0)}/{e.get('total', 0)}"))
@@ -926,7 +974,8 @@ class ProxyGUI(tk.Tk):
             self._country_choices = tuple(labels)
             self._country_values = {text: cc for cc, text in choices}
             self.country_combo.configure(values=labels)
-        names = {cc: (e.get("name") or cc) for cc, e in scope.items()}
+        names = {cc: (e.get("name") or cc) for cc, e in scope.items()
+                 if not region or region_of(cc) == region}
         if names != self._country_names:
             self._country_names = names
         active = snap.get("country") or ""
@@ -948,20 +997,66 @@ class ProxyGUI(tk.Tk):
             self._country_var.set(wanted)
 
     def _refresh_regions(self, snap: dict):
-        """Rebuild the Region filter from the areas the pool covers."""
+        """Rebuild the Region box of the exit cascade from the pool."""
         scope = snap.get("pool_countries") or {}
         present = sorted({region_of(cc) for cc in scope} - {""},
                          key=str.lower)
-        values = ["All regions"] + present
+        active = snap.get("region") or ""
+        if active and active not in present:
+            # a scope whose upstreams all left must stay visible rather
+            # than the panel claiming "Anywhere" while it still restricts
+            present.append(active)
+            present.sort(key=str.lower)
+        values = ["Anywhere"] + present
         if tuple(values) != self._region_choices:
             self._region_choices = tuple(values)
-            current = self._region_var.get()
-            if current not in values:
-                # keep a stale pick visible rather than silently widening
-                # the filter -- the countries it covered really are gone
-                values = values + [current]
-                self._region_choices = tuple(values)
             self.region_combo.configure(values=values)
+        wanted = active or "Anywhere"
+        if self._region_var.get() != wanted:
+            self._region_var.set(wanted)
+
+    def _refresh_states(self, snap: dict):
+        """Rebuild the State box from the states inside region + country."""
+        scope = snap.get("pool_states") or {}
+        active = snap.get("state") or ""
+        choices = [("", "Anywhere")]
+        for name, count in sorted(scope.items(), key=lambda kv: kv[0].lower()):
+            choices.append((name, f"{name} · {count}"))
+        if active and active not in scope:
+            # keep showing a state that no longer has an upstream in the
+            # pool -- it is still what the engine is restricting traffic to
+            choices.append((active, f"{active} · not in pool"))
+        labels = [text for _, text in choices]
+        if tuple(labels) != self._state_choices:
+            self._state_choices = tuple(labels)
+            self._state_values = {text: name for name, text in choices}
+            self.state_combo.configure(values=labels)
+        wanted = next((text for name, text in choices if name == active), "")
+        if not wanted:
+            wanted = "Anywhere"
+        if self._state_var.get() != wanted:
+            self._state_var.set(wanted)
+
+    def _on_region_pick(self, _event=None):
+        region = self._region_var.get()
+        region = "" if region in ("", "Anywhere") else region
+        try:
+            # the engine logs the change itself, on every thread
+            self.engine.set_region(region)
+        except ValueError as exc:
+            self._append_log(time.time(), "error", f"exit region: {exc}")
+            self._refresh_regions(self.engine.snapshot())
+            return
+        # written straight away: a restart (or a kill) must not lose it
+        self._save_state()
+        snap = self.engine.snapshot()
+        # everything below the region may no longer fit: re-offer it from
+        # here, exactly like picking a new country re-offers its states
+        self._refresh_regions(snap)
+        self._refresh_countries(snap)
+        self._refresh_states(snap)
+        self.status_var.set(f"Exit region: {self._region_var.get()}")
+        self._render_pool(force=True)
 
     def _on_country_pick(self, _event=None):
         code = self._country_values.get(self._country_var.get(), "")
@@ -974,9 +1069,27 @@ class ProxyGUI(tk.Tk):
             return
         # written straight away: a restart (or a kill) must not lose it
         self._save_state()
+        snap = self.engine.snapshot()
         self.status_var.set(f"Exit country: "
                             f"{self._country_var.get()}")
-        self._refresh_countries(self.engine.snapshot())
+        self._refresh_countries(snap)
+        # a state from the country we just left is gone from the pool
+        # the engine keeps -- the box has to follow it
+        self._refresh_states(snap)
+        self._render_pool(force=True)
+
+    def _on_state_pick(self, _event=None):
+        state = self._state_values.get(self._state_var.get(), "")
+        try:
+            self.engine.set_state(state)
+        except ValueError as exc:
+            self._append_log(time.time(), "error", f"exit state: {exc}")
+            self._refresh_states(self.engine.snapshot())
+            return
+        self._save_state()
+        snap = self.engine.snapshot()
+        self._refresh_states(snap)
+        self.status_var.set(f"Exit state: {self._state_var.get()}")
         self._render_pool(force=True)
 
     def _on_https_toggle(self):
@@ -1066,7 +1179,8 @@ class ProxyGUI(tk.Tk):
         else:
             badge = "Unverified"
         return (n["label"], n.get("kind", "HTTP"),
-                n.get("cc") or "—", badge, latency,
+                n.get("cc") or "—", n.get("state_label") or "—", badge,
+                latency,
                 _ago(n["last_check"]), str(n["hits"]),
                 (n["last_error"] or "")[:70])
 
@@ -1102,6 +1216,12 @@ class ProxyGUI(tk.Tk):
                 parts.append(f"blocked by targets: {n['blocks']}×")
             if n["last_error"]:
                 parts.append(f"last error: {n['last_error']}")
+            where = ", ".join(b for b in (n.get("state"), n.get("city"))
+                              if b)
+            if where:
+                # only when the city database knows the address: an
+                # "unknown" place would just be noise in the detail line
+                parts.insert(4, f"place: {where}")
             self.detail.configure(text="   ·   ".join(parts))
         else:
             self.detail.configure(text=f"{len(selection)} upstreams selected")
@@ -1305,6 +1425,7 @@ class ProxyGUI(tk.Tk):
         self._update_buttons()
         self._refresh_countries(snap)
         self._refresh_regions(snap)
+        self._refresh_states(snap)
 
     def _update_buttons(self):
         running = self.engine.running
@@ -1358,6 +1479,79 @@ class ProxyGUI(tk.Tk):
                            text="■ concurrent connections")
 
     # ------------------------------------------------------------ settings
+    @staticmethod
+    def _geo_status_text() -> str:
+        """One line for the Settings row: is the state database there?"""
+        import geodb
+
+        info = geodb.city_status()
+        if not info["available"]:
+            return "not installed — needed for state scope"
+        size = f"{info['size'] / 1_048_576:.1f} MB"
+        when = (time.strftime("%Y-%m-%d", time.localtime(info["updated"]))
+                if info.get("updated") else "")
+        return "installed · " + " · ".join(x for x in (size, when) if x)
+
+    def _download_geo(self) -> None:
+        """Fetch the city/state database once -- in the background.
+
+        The panel must stay usable while ~60 MB downloads, and worker
+        threads never touch Tk: progress and the result travel through the
+        same queue the engine's log uses.
+        """
+        if self._geo_busy:
+            return
+        self._geo_busy = True
+        if self.geo_btn is not None:
+            self.geo_btn.configure(state="disabled", text="Downloading…")
+        self.status_var.set("Downloading the state/city database…")
+
+        import geodb
+
+        def progress(done: int, total: int) -> None:
+            text = f"downloading… {done / 1_048_576:.1f} MB"
+            if total:
+                text += f" / {total / 1_048_576:.0f} MB ({100 * done // total}%)"
+            self._q.put(("geo", text))
+
+        def worker():
+            path, error = None, None
+            try:
+                path = geodb.fetch_city_db(progress=progress)
+                # every row now has a place: re-tag the pool (health is
+                # kept for the entries that survive the rewrite)
+                self.engine.set_proxies(list(self.engine.proxies()))
+            except Exception as exc:                 # surface, don't crash
+                path, error = None, exc
+            self._q.put(("geo-done", path, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _geo_progress(self, text: str) -> None:
+        if self.geo_status is not None:
+            self.geo_status.set(text)
+
+    def _geo_finished(self, path, error) -> None:
+        self._geo_busy = False
+        if self.geo_status is not None:
+            self.geo_status.set(str(error) if error
+                                else self._geo_status_text())
+        if self.geo_btn is not None and self.geo_btn.winfo_exists():
+            self.geo_btn.configure(state="normal", text="Refresh")
+        if error is not None:
+            self.status_var.set(str(error))
+            self._append_log(time.time(), "error", f"state database: {error}")
+            return
+        self._append_log(time.time(), "info", f"state database installed: "
+                                              f"{path}")
+        self.status_var.set("State/city database installed.")
+        # the cascade can offer states now: re-offer every box from the top
+        snap = self.engine.snapshot()
+        self._refresh_regions(snap)
+        self._refresh_countries(snap)
+        self._refresh_states(snap)
+        self._render_pool(force=True)
+
     def _open_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.lift()
@@ -1365,7 +1559,7 @@ class ProxyGUI(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Settings")
         win.configure(bg=BG)
-        win.geometry("430x560")
+        win.geometry("430x620")
         win.transient(self)
         win.grab_set()
         self.settings_win = win
@@ -1387,13 +1581,33 @@ class ProxyGUI(tk.Tk):
             vars_[key] = (var, kind)
             ttk.Entry(row, textvariable=var, width=16).pack(side="right")
 
+        # ---- the database behind the State column and the State box -----
+        import geodb
+        installed = geodb.city_available()
+        geo = tk.Frame(body, bg=BG)
+        geo.pack(fill="x", pady=(10, 0))
+        tk.Label(geo, text="State/city database", bg=BG, fg=TEXT, width=26,
+                 anchor="w").pack(side="left")
+        self.geo_status = tk.StringVar(value=self._geo_status_text())
+        tk.Label(geo, textvariable=self.geo_status, bg=BG, fg=MUTED,
+                 font=F["small"], anchor="w").pack(side="left")
+        self.geo_btn = ttk.Button(geo, width=10,
+                                  text="Refresh" if installed else "Download",
+                                  command=self._download_geo)
+        self.geo_btn.pack(side="right")
+
         note = ("Settings apply the next time you start the proxy.\n"
                 "The port change always requires a restart.\n"
                 "“Rotate exit on status” is a comma-separated list of the\n"
                 "statuses that make a request retry from another exit IP\n"
                 "(429/403 blocks; empty switches it off).\n"
                 "“Refresh list from URL(s)” auto-reloads fresh proxies\n"
-                "from plain-text lists while running (empty switches off).")
+                "from plain-text lists while running (empty switches off).\n"
+                "“State/city database” fills the State column and the State\n"
+                "box of Exit via: one ~60 MB download (DB-IP City Lite, CC\n"
+                "BY 4.0) into "
+                f"{geodb.city_path().parent}, then every state\n"
+                "lookup is offline.")
         tk.Label(body, text=note, bg=BG, fg=MUTED, justify="left",
                  font=F["small"]).pack(anchor="w", pady=(12, 0))
 

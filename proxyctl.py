@@ -86,6 +86,39 @@ def proxy_url() -> str:
     return f"http://{host}:{port}"
 
 
+def exit_scope() -> str:
+    """Where traffic is allowed to leave, read from the state file.
+
+    Mirrors the panel's cascade (Region -> Country -> State) plus the hard
+    switches, so `proxyctl status` answers "what is my exit scope?" without
+    having to talk to the running proxy.  `anywhere` means nothing is
+    restricting the pool; `unknown` means there is no readable state file.
+    """
+    try:
+        settings = json.loads(STATE_FILE.read_text(encoding="utf-8"))["settings"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unknown (no state file)"
+    bits = []
+    region = str(settings.get("region") or "").strip()
+    if region:
+        bits.append(f"region={region}")
+    country = str(settings.get("country") or "").strip()
+    if country and country != "-":
+        bits.append(f"country={country.upper()}")
+    state = str(settings.get("state") or "").strip()
+    if state:
+        bits.append(f"state={state}")
+    https = settings.get("https_only")
+    if isinstance(https, str):              # a hand-edited state file may
+        https = https.strip().lower() in ("1", "true", "yes", "on")
+    if https:
+        bits.append("HTTPS-only")
+    use = str(settings.get("use_only") or "").strip()
+    if use:
+        bits.append(f"use={use}")
+    return " · ".join(bits) if bits else "anywhere"
+
+
 def home_hint(path: Path) -> str:
     """`~/…` form of an absolute path, for pasting into a shell or a label."""
     try:
@@ -516,6 +549,7 @@ def status() -> int:
     listening = is_listening()
     print(f"proxy      {proxy_url()}   "
           f"({'accepting connections' if listening else 'NOT running'})")
+    print(f"exit       {exit_scope()}")
     if listening:
         print(f"answering  {'yes' if works() else 'no -- health check may '
                                              'still be running'}")

@@ -93,9 +93,12 @@ def test_pool_render(app):
     check("count label", app.pool_count.cget("text").endswith("/40 alive"),
           app.pool_count.cget("text"))
     first = app.tree.item(rows[0], "values")
-    check("row shape", len(first) == 8, str(first))
+    check("row shape", len(first) == 9, str(first))
     check("default type column", first[1] == "HTTP", str(first[1]))
     check("private ip has no country", first[2] == "—", str(first[2]))
+    check("private ip has no state", first[3] == "—", str(first[3]))
+    check("status follows the state column", first[4] == "Unverified",
+          str(first[4]))
 
     # text filtering (substring match on proxy or error)
     app._filter_var.set("10.0.0.7")
@@ -437,6 +440,57 @@ def test_dialogs(app):
     check("settings lists the list-refresh options",
           "refresh_url" in spec_keys and "refresh_interval" in spec_keys,
           str(spec_keys))
+
+    # ---- state/city database: status line + one-time download -----------
+    check("geo status row present",
+          app.geo_status is not None
+          and ("installed" in app.geo_status.get()
+               or "not installed" in app.geo_status.get()),
+          str(app.geo_status and app.geo_status.get()))
+    check("geo download button present",
+          app.geo_btn is not None and app.geo_btn.winfo_exists())
+    check("geo status text says where it stands",
+          "installed" in app._geo_status_text(), app._geo_status_text())
+
+    # the fetch runs off the UI thread; stub it so no test ever downloads
+    import geodb
+    real_fetch = geodb.fetch_city_db
+
+    def fake_fetch(url=None, progress=None):
+        if progress:
+            progress(1_048_576, 4_194_304)
+        return Path(str(gui.STATE_FILE) + ".mmdb"), None
+
+    geodb.fetch_city_db = fake_fetch
+    try:
+        # progress travels through the engine's queue, never a worker
+        # thread touching Tk directly
+        app._q.put(("geo", "downloading… 1.0 MB / 4 MB (25%)"))
+        pump(app, ticks=4)
+        check("progress reaches the status line",
+              "downloading" in (app.geo_status.get() or ""),
+              str(app.geo_status.get()))
+        app.geo_status.set(app._geo_status_text())
+
+        app._download_geo()
+        check("download starts in the background",
+              app._geo_busy and str(app.geo_btn["state"]) == "disabled",
+              f"{app._geo_busy} {app.geo_btn['state']}")
+        finished = wait_until(lambda: not app._geo_busy, app, timeout=12)
+        check("download reports finished", finished)
+        check("button re-enabled when done",
+              str(app.geo_btn["state"]) == "normal"
+              and app.geo_btn.cget("text") == "Refresh",
+              f"{app.geo_btn['state']} {app.geo_btn.cget('text')}")
+        check("log says the database is installed",
+              "state database installed" in app.log_text.get("1.0", "end"),
+              app.log_text.get("1.0", "end")[-200:])
+        check("cascade re-offered after the download",
+              app.engine is not None and not app._geo_busy,
+              str(app._geo_busy))
+    finally:
+        geodb.fetch_city_db = real_fetch
+
     win.destroy()
     pump(app, ticks=2)
 
@@ -589,7 +643,7 @@ def test_every_button(app):
         app._status_var.set("All")
         app._render_pool(force=True)
 
-        for col in ("proxy", "kind", "country", "status", "latency",
+        for col in ("proxy", "kind", "country", "state", "status", "latency",
                     "checked", "hits", "error"):
             app._sort_by(col)
             app._sort_by(col)          # and the reverse direction
@@ -630,8 +684,8 @@ def test_every_button(app):
 
 
 def test_categories(app):
-    """Strength tiers, region filter and the category badges."""
-    print("\nstrength / region / category filters")
+    """Strength tiers, the exit cascade and the category badges."""
+    print("\nstrength / exit cascade / category filters")
     import geodb
     real = geodb.lookup
     geo = {"8.8.8.8": ("US", "United States"),
@@ -658,7 +712,7 @@ def test_categories(app):
         def rows():
             return list(app.tree.get_children())
 
-        badges = {iid: app.tree.item(iid, "values")[3]
+        badges = {iid: app.tree.item(iid, "values")[4]
                   for iid in rows()}
         check("status cell carries the strength badge",
               badges.get("9.9.9.9:8080") == "Alive · Strong",
@@ -682,12 +736,19 @@ def test_categories(app):
               and "North America" in app._region_choices
               and "Oceania" in app._region_choices,
               str(app._region_choices))
+        # the exit scope is routing, not a display filter: a pick narrows
+        # what the engine may use and leaves the table showing the whole
+        # pool -- the tally is what says out loud where traffic leaves
         app._region_var.set("Europe")
-        app._render_pool(force=True)
-        check("region filter narrows the table",
-              rows() == ["9.9.9.9:8080"], str(rows()))
-        app._region_var.set("All regions")
-        app._render_pool(force=True)
+        app._on_region_pick()
+        pump(app, ticks=3)
+        check("region pick reaches the engine",
+              app.engine.region == "Europe", str(app.engine.region))
+        check("exit scope does not narrow the table",
+              len(rows()) == 3, str(rows()))
+        check("tally names the exit",
+              "exit Europe" in app.pool_count.cget("text"),
+              app.pool_count.cget("text"))
 
         app._filter_var.set("strong")
         app._render_pool(force=True)
@@ -712,10 +773,131 @@ def test_categories(app):
     finally:
         geodb.lookup = real
         app._status_var.set("All")
-        app._region_var.set("All regions")
+        app.engine.set_region("")       # leave no exit scope behind
+        app._region_var.set("Anywhere")
         app._filter_var.set("")
         app._sort = ("status", False)
         app.engine.set_proxies([f"10.0.0.{i}:8080" for i in range(1, 41)])
+        app._render_pool(force=True)
+
+
+def test_exit_cascade(app):
+    """Region -> Country -> State in the panel: every box only offers what
+    the one above it contains, no level may contradict a wider one, and a
+    pick narrows the engine instead of the table."""
+    print("\nexit cascade: region -> country -> state")
+    import json
+    import geodb
+    real = geodb.lookup, geodb.locate
+    GEO = {"9.9.9.9": ("DE", "Germany"), "8.8.8.8": ("US", "United States"),
+           "1.1.1.1": ("AU", "Australia"), "10.0.0.1": ("US", "United States")}
+    STATE = {"9.9.9.9": ("Berlin", "", "Berlin"),
+             "8.8.8.8": ("California", "", "Mountain View"),
+             "1.1.1.1": ("New South Wales", "", "Sydney"),
+             "10.0.0.1": ("Texas", "", "Dallas")}
+    geodb.lookup = lambda h: GEO.get(h, ("", ""))
+    geodb.locate = lambda h: STATE.get(h, ("", "", ""))
+
+    def state_names():
+        return {app._state_values[text] for text in app._state_values}
+
+    def country_names():
+        return {app._country_values[text] for text in app._country_values}
+
+    try:
+        app.engine.set_proxies(["9.9.9.9:8080", "8.8.8.8:8080",
+                                "1.1.1.1:8080", "10.0.0.1:8080"])
+        pump(app, ticks=6)
+        snap = app.engine.snapshot()
+        check("state tally in the snapshot",
+              snap["pool_states"] == {"Berlin": 1, "California": 1,
+                                      "New South Wales": 1, "Texas": 1},
+              str(snap.get("pool_states")))
+        check("region box built from the pool",
+              set(app._region_choices) >= {"Anywhere", "Europe",
+                                           "North America", "Oceania"},
+              str(app._region_choices))
+        check("state box offers every state",
+              state_names() == {"", "Berlin", "California",
+                                "New South Wales", "Texas"},
+              str(app._state_choices))
+
+        # ---- region -----------------------------------------------------
+        app._region_var.set("Europe")
+        app._on_region_pick()
+        pump(app, ticks=3)
+        check("region reaches the engine",
+              app.engine.region == "Europe", str(app.engine.region))
+        check("countries re-offered inside the region",
+              country_names() == {"", "DE"}, str(app._country_choices))
+        check("states re-offered inside the region",
+              state_names() == {"", "Berlin"}, str(app._state_choices))
+        check("region pick does not narrow the table",
+              len(app.tree.get_children()) == 4,
+              str(len(app.tree.get_children())))
+
+        # ---- country ----------------------------------------------------
+        de = next(t for t, code in app._country_values.items() if code == "DE")
+        app._country_var.set(de)
+        app._on_country_pick()
+        pump(app, ticks=3)
+        check("country reaches the engine",
+              app.engine.country == "DE", str(app.engine.country))
+        check("states follow the country",
+              state_names() == {"", "Berlin"}, str(app._state_choices))
+
+        # ---- state ------------------------------------------------------
+        berlin = next(t for t, name in app._state_values.items()
+                      if name == "Berlin")
+        app._state_var.set(berlin)
+        app._on_state_pick()
+        pump(app, ticks=3)
+        check("state reaches the engine",
+              app.engine.state == "Berlin", str(app.engine.state))
+        saved = json.loads(Path(gui.STATE_FILE).read_text(encoding="utf-8"))
+        check("cascade written to the state file right away",
+              saved["settings"].get("region") == "Europe"
+              and saved["settings"].get("country") == "DE"
+              and saved["settings"].get("state") == "Berlin",
+              str({k: saved["settings"].get(k)
+                   for k in ("region", "country", "state")}))
+        for n in app.engine._nodes:
+            n.status = "alive"
+        check("rotation narrowed to the state",
+              [n.label for n in app.engine._candidates()] == ["9.9.9.9:8080"],
+              str([n.label for n in app.engine._candidates()]))
+        check("table still shows the whole pool",
+              len(app.tree.get_children()) == 4,
+              str(len(app.tree.get_children())))
+        check("tally names the full place",
+              "exit Berlin" in app.pool_count.cget("text"),
+              app.pool_count.cget("text"))
+
+        # ---- a wider pick must drop what no longer fits ------------------
+        app._region_var.set("Oceania")
+        app._on_region_pick()
+        pump(app, ticks=3)
+        check("region switch clears country and state",
+              app.engine.region == "Oceania" and app.engine.country == ""
+              and app.engine.state == "",
+              f"{app.engine.region} {app.engine.country} {app.engine.state}")
+        check("cascade boxes follow the new region",
+              country_names() == {"", "AU"}
+              and state_names() == {"", "New South Wales"},
+              f"{app._country_choices} {app._state_choices}")
+        check("stale state box label cleared",
+              app._state_var.get() in ("", "Anywhere"), app._state_var.get())
+    finally:
+        geodb.lookup, geodb.locate = real
+        app.engine.set_region("")
+        app.engine.set_country("")
+        app.engine.set_state("")
+        app._region_var.set("Anywhere")
+        app._status_var.set("All")
+        app._filter_var.set("")
+        app._sort = ("status", False)
+        app.engine.set_proxies([f"10.0.0.{i}:8080" for i in range(1, 41)])
+        pump(app, ticks=3)
         app._render_pool(force=True)
 
 
@@ -887,6 +1069,7 @@ def main():
         test_https_toggle(app)
         test_use_chips(app)
         test_categories(app)
+        test_exit_cascade(app)
         test_log(app)
         test_dialogs(app)
         test_every_button(app)

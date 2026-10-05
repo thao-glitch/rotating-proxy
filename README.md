@@ -122,8 +122,14 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
                        socks4://… or socks5://…
 --country CODE         only use upstreams in this country
                        (ISO code or name, e.g. `DE` or `Germany`)
+--region NAME          only use upstreams in this world region
+                       (e.g. `Europe`, `North America`)
+--state NAME           only use upstreams in this state/province
+                       (e.g. `California`; needs the state database)
 --https-only           only use upstreams that can tunnel HTTPS
 --no-https-only        drop that restriction again
+--geo-status           print where the state/city database stands, then exit
+--geo-fetch            download that database once (offline afterwards)
 --use FLAGS            comma-separated routing scope from http, socks4,
                        socks5, strong, fast (empty = every upstream)
 --rotate-on CODES      comma-separated statuses that make a plain-HTTP
@@ -141,10 +147,12 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
 --no-autostart         open the panel without starting the proxy
 ```
 
-Both scope mechanisms work in all three modes: they override whatever the
+All of the scope flags work in all three modes: they override whatever the
 state file had, scope the panel's picker, the `--cli` pool, and the set
 `--check` probes. Exit codes from `--check`: `0` if at least one upstream is
-alive (and, with `--https-only` or `--use`, matches the scope), `1` otherwise.
+alive (and, with `--https-only`, `--use` or a region/country/state, matches
+the scope), `1` otherwise — an empty scope prints
+`error: no upstream in <place>` and fails rather than quietly widening.
 
 ## Pointing apps, browsers and the whole system at it
 
@@ -159,7 +167,8 @@ alive (and, with `--https-only` or `--use`, matches the scope), `1` otherwise.
 ```bash
 ./proxyctl on            # all three at once
 ./proxyctl off           # undo all three
-./proxyctl status        # what is pointed where, and is the proxy answering
+./proxyctl status        # what is pointed where, where traffic exits,
+                         # and is the proxy answering
 ./proxyctl env on        # or one layer at a time
 ./proxyctl firefox on
 ./proxyctl browsers on
@@ -212,37 +221,75 @@ that looks like a proxy list:
   The first two columns become the upstream and a `Socks4`/`Socks5`/`HTTP`
   column anywhere in the row sets its type. A two-letter column (`HK`) is
   remembered as that row's exit country when it could not be resolved
-  otherwise — see [Choosing the exit country](#choosing-the-exit-country).
+  otherwise — see [Choosing where traffic leaves](#choosing-where-traffic-leaves-region-country-state).
 
 Your edits are persisted to `proxy_state.json` next to the scripts. Delete that
 file to go back to the shipped list.
 
-## Choosing the exit country
+## Choosing where traffic leaves: Region, Country, State
 
-**Exit via**, in the toolbar of the *Upstream pool* panel, restricts where
-traffic leaves your machine. The list only contains countries the pool
-actually has, each with its `alive/total` count, sorted so the usable ones
-come first. Picking one applies immediately — no restart and no rebind — and
-picking **Anywhere** puts it back.
+**Exit via**, in the toolbar of the *Upstream pool* panel, is a cascade of
+three boxes — **Region ▾ Country ▾ State ▾** — restricting where traffic
+leaves your machine. Each box only offers what the one above it contains
+(pick *North America* and the country box offers Canada/Mexico/US and
+nothing else; pick *United States* and the state box offers the states that
+actually have upstreams in the pool). Picking anything applies immediately —
+no restart, no rebind — and is written to `proxy_state.json` the moment you
+pick it. **Anywhere** in a box puts that level back.
 
-* **Where the country comes from** — every upstream's address is resolved
-  against the GeoLite Country database
-  (`/usr/share/GeoIP/GeoIP.dat`, from `geoip-database` + `python3-geoip`),
-  entirely offline and cached. No network call, no rate limit.
-* **Fallback** — if no database is installed, a `HK`-style column in a pasted
-  export is used instead, so TSV imports still work on a bare machine.
-* **It really routes** — candidate selection only ever sees upstreams of the
-  chosen country, so a German exit can never silently become an American one.
-* **An empty scope fails honestly** — when none of that country's upstreams
-  are alive you get a `502` and a throttled *"no usable upstream in Germany
-  (DE)"* warning, not traffic from somewhere you did not ask for.
+* **The table stays a view of the whole pool.** The cascade is routing, not
+  a display filter: narrowing the exit never hides rows. Where traffic is
+  going is spelled out in the tally instead —
+  `600/600 alive · exit California, United States (US) · strong fallback` —
+  and `proxyctl status` prints the same scope as its `exit` line.
+* **No level may contradict a wider one.** Choosing a country outside the
+  current region is refused, and switching region drops a country/state that
+  the new region does not offer, so a scope can never end up empty by
+  accident (that is how a browser ends up with no internet at all).
+* **It really routes** — candidate selection only ever sees upstreams that
+  satisfy *every* level set, so a German exit can never silently become an
+  American one. Region, country and state are **hard** scope: an empty
+  survivor list fails honestly with a `502` and a throttled
+  *"no usable upstream in California, United States (US)"* warning.
 * Each health sweep reports the scope too, e.g.
   `health check done in 37.9s — 179 alive … · Germany (DE): 4 alive of 22`.
 
-The **Country** column shows the resolved code (`—` when nothing could be
-resolved), is sortable, and the filter box matches it: type `germany`, `DE`
-or `socks5` to narrow the table down. While a restriction is active the pool
-tally ends with `· exit DE`.
+**Where each level comes from**
+
+* **Region** — derived offline from the exit codes (Europe / Asia / Africa /
+  North & South America / Oceania), no database needed.
+* **Country** — resolved against the GeoLite Country database
+  (`/usr/share/GeoIP/GeoIP.dat`, from `geoip-database` + `python3-geoip`),
+  entirely offline and cached; if none is installed, a `HK`-style column in
+  a pasted export is used instead, so TSV imports still work bare.
+* **State** — needs the *state/city* database, which is **downloaded once**
+  and then used offline, like the country one:
+
+  ```bash
+  python3 run.py --geo-status    # where it stands, then exit
+  python3 run.py --geo-fetch     # fetch it once (~120 MB)
+  ```
+
+  The same two actions live in *Settings* (the **state/city database** row
+  shows `installed · 121.1 MB · 2026-10-01` with a **Refresh** button that
+  downloads in the background and re-tags the pool when it lands). The file
+  is DB-IP City Lite (CC BY 4.0), stored at
+  `~/.config/rotating-proxy/geo/dbip-city-lite.mmdb`, downloaded compressed,
+  validated before it replaces anything, and read through a bundled MMDB
+  reader — no third-party Python packages, no network calls afterwards.
+  Without it every address simply has no state, and the state box says so
+  rather than pretending.
+
+The **Country** column shows the resolved code and the **State** column the
+resolved state (`—` when nothing could be resolved); both are sortable and
+both are matched by the filter box: type `california`, `germany`, `DE` or
+`socks5` to narrow the table down. Selecting a row spells the exit out in
+the detail line (`place: California, United States (US)`).
+
+```bash
+python3 run.py --cli --region Europe --country DE --state Berlin
+python3 run.py --check --state California      # 1 if nothing is in scope
+```
 
 ## Routing through HTTPS-capable upstreams
 
@@ -293,16 +340,25 @@ through*. The dropdowns and the filter box only decide what the table
   that protocol, click several to allow several, and clear them all to
   allow every kind of upstream again.
 * **HTTPS** — the same switch as `--https-only` above, in chip form.
-* **Strong / Fast** — only upstreams in the Strong strength tier, resp.
+* **Strong / Fast** — prefer upstreams in the Strong strength tier, resp.
   with a measured latency of at most 300 ms (`fast`).
-* **They stack** with the exit country and with each other, work while
+* **Two different kinds of scope.** The protocol chips and **HTTPS** are
+  *promises* — an upstream outside them is exactly what you asked not to
+  use, so if nothing matches you get a `502` and a warning that names the
+  filter (`no upstream matches the socks5 routing filter — requests will
+  502 until one comes back`). **Strong** and **Fast** are *preferences*:
+  when nobody in scope has proven itself yet the request still goes out
+  through the best exit that is there, with a throttled warning and
+  `scope_fallback: ["strong"]` in the snapshot — the panel's tally shows it
+  as `strong fallback`. Refusing to route because no exit has proven itself
+  fast yet is how a pointed browser ends up with no internet at all.
+* **They stack** with the exit cascade and with each other, work while
   the proxy is running, and save to `proxy_state.json` the moment you
   click. The log confirms the scope: `upstream selection: only
   socks5,strong`.
-* **It fails honestly** — a scope nothing matches warns like the country
-  scope does (`no upstream matches the strong routing filter — requests
-  will 502 until one comes back`) instead of silently routing anywhere,
-  and the status bar shows `Routing scope: socks5, strong` while active.
+* The status bar shows `Routing scope: socks5, strong` while a restriction
+  is active, and the status dropdown's **Strong** / **Fast** entries filter
+  the table to those rows.
 * From the command line: `python3 run.py --use socks5,strong` in every
   mode; an unknown flag is rejected up front with the list of valid ones.
 
@@ -357,11 +413,11 @@ Every upstream carries more than alive/dead:
 * **Speed** — the *Latency* column shows the last measured round trip, the
   **Fast** status entry filters to ≤ 300 ms, and the pool tally counts them
   (`142/600 alive · 17 strong · 9 fast`).
-* **Region** — beyond the per-country picker, a *Region* dropdown groups
-  the pool into Europe / Asia / Africa / North & South America / Oceania
-  (derived offline from the exit codes). It is a table filter, and the free-
-  text filter matches it too: type `europe`, `strong`, `socks5` or `germany`
-  to narrow the list.
+* **Region** — the first box of the *Exit via* cascade groups the pool into
+  Europe / Asia / Africa / North & South America / Oceania (derived offline
+  from the exit codes) and restricts where traffic leaves; it no longer
+  hides rows. The free-text filter still matches it: type `europe`,
+  `strong`, `socks5`, `germany` or `california` to narrow the list.
 * **HTTPS and protocol** — the `HTTPS` status entry shows only tunnellers,
   `Type` sorts/groups HTTP vs SOCKS4 vs SOCKS5, and each row's health sweep
   keeps `Last check` / `Last error` current.
@@ -406,23 +462,28 @@ full-width cards underneath.
   now*, the listen endpoint, and entry points for *Apps* and *Settings*
   (with *About* under the *Help* menu). Cards across the top cover requests
   served, active connections, failures, pool health, uptime and traffic.
-* **Upstream pool** — sortable table (`Proxy`, `Type`, `Country`, `Status`,
-  `Latency`, `Last check`, `Served`, `Last error`) with the **Exit via**
-  country picker, the **Use** row of routing chips (`HTTP`, `HTTPS`,
-  `SOCKS4`, `SOCKS5`, `Strong`, `Fast`) and the **Region** dropdown in its
-  toolbar. The *Status* cell shows the strength badge
-  (`Alive · Strong`), addresses sort numerically (`10.0.0.2` ahead of
+* **Upstream pool** — sortable table (`Proxy`, `Type`, `Country`, `State`,
+  `Status`, `Latency`, `Last check`, `Served`, `Last error`) with the
+  **Exit via** cascade (Region → Country → State), the **Use** row of
+  routing chips (`HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`, `Strong`, `Fast`)
+  and the filter row in its toolbar. The *Status* cell shows the strength
+  badge (`Alive · Strong`), addresses sort numerically (`10.0.0.2` ahead of
   `10.0.0.10`) in every order — and in the default status view, equal ranks
   tiebreak by strength, then by address. Type `socks4` in the filter box to
-  see just the SOCKS4 entries, `germany` for one country, `europe` for the
-  whole region, `strong` for the proven exits, and use the status dropdown
-  to narrow it to alive/dead/other/HTTPS/strong/fast.
+  see just the SOCKS4 entries, `germany` for one country, `california` for
+  one state, `europe` for the whole region, `strong` for the proven exits,
+  and use the status dropdown to narrow it to
+  alive/dead/other/HTTPS/strong/fast. The tally says where traffic is
+  actually going: `600/600 alive · exit California, United States (US) ·
+  strong fallback`.
 * **Log** — timestamped engine log with level filtering and colour.
 * **Traffic** — rolling sparkline of requests and concurrent connections.
 * **Settings** — listen address, health-check interval, retries, timeouts,
   parallel probes, whether to also probe HTTPS tunnel support, the
-  *Rotate exit on status* list behind the block-rotation feature, and the
-  list-refresh URL(s)/interval behind the auto-restock feature.
+  *Rotate exit on status* list behind the block-rotation feature, the
+  list-refresh URL(s)/interval behind the auto-restock feature, and the
+  **state/city database** row (its size and build date, with **Refresh** to
+  download it once for state-level exit selection).
 * **Apps** — the three switches described above, with their live status and a
   one-click *Point everything at this proxy* / *Take everything off*.
 
@@ -470,7 +531,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 473 checks
+That is the whole procedure: the `release` workflow runs the 563 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -486,14 +547,19 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 207 checks
-xvfb-run -a python3 test_gui.py        # 151 checks (needs a display or Xvfb)
-python3 test_proxyctl.py               # 115 checks
+python3 test_engine.py                 # 262 checks
+xvfb-run -a python3 test_gui.py        # 182 checks (needs a display or Xvfb)
+python3 test_proxyctl.py               # 119 checks
 ```
 
-473 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+563 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
-country or HTTPS-only flag from a real session can never leak into the checks.
+cascade, country or HTTPS-only flag from a real session can never leak into
+the checks. The geo lookups the cascade tests need are stubbed, so the suite
+never depends on which GeoIP databases your machine happens to have; the one
+test that does read the installed state/city database (the bundled `mmdb`
+reader) skips itself when there is none, and cross-checks the reader against
+`maxminddb` when that happens to be installed.
 
 The first two suites build everything locally (a target HTTP server, a mock
 HTTP proxy and mock SOCKS4/SOCKS5 servers), so no internet access is required

@@ -9,7 +9,11 @@ Rotating Proxy — entry point.
     python3 run.py --host 0.0.0.0  listen on all interfaces (use with care)
     python3 run.py --no-autostart  open the panel without starting the proxy
     python3 run.py --country DE    only ever exit through Germany
+    python3 run.py --region Europe --country DE   …or anywhere in Europe
+    python3 run.py --region US --state California …or exactly one state
     python3 run.py --https-only    only use upstreams that tunnel HTTPS
+    python3 run.py --geo-fetch     download the state/city database once
+    python3 run.py --geo-status    what geo data is installed right now
 
 Point any HTTP/HTTPS client (browser, curl, scraper, …) at the address the
 panel shows -- by default http://127.0.0.1:8888.
@@ -22,7 +26,8 @@ import signal
 import sys
 import time
 
-from engine import DEFAULTS, FAST_MS, RotatingProxy, USE_FLAGS
+from engine import (DEFAULTS, FAST_MS, RotatingProxy, USE_FLAGS,
+                    region_of)
 from proxylist import PROXY_LIST
 
 
@@ -65,6 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--country", metavar="CODE",
                    help="only use upstreams in this country (ISO code or "
                         "name); empty for anywhere")
+    p.add_argument("--region", metavar="NAME",
+                   help="only use upstreams in this world area (Europe, "
+                        "Asia, North America, …); empty for anywhere")
+    p.add_argument("--state", metavar="NAME",
+                   help="only use upstreams in this state/province "
+                        "(California, Bavaria, …) -- needs the city "
+                        "database: `python3 run.py --geo-fetch`")
     p.add_argument("--https-only", action=argparse.BooleanOptionalAction,
                    default=None,
                    help="only use upstreams that can tunnel HTTPS "
@@ -84,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refresh-interval", type=int,
                    default=DEFAULTS["refresh_interval"],
                    help="seconds between automatic proxy list refreshes")
+    p.add_argument("--geo-fetch", action="store_true",
+                   help="download the city/state database once (about 60 MB, "
+                        "DB-IP City Lite, CC BY 4.0) and exit; every state "
+                        "lookup is offline from then on")
+    p.add_argument("--geo-status", action="store_true",
+                   help="print which geo databases are installed and exit")
     p.add_argument("--use", metavar="FLAGS",
                    default=DEFAULTS["use_only"],
                    help=f"comma-separated routing scope: "
@@ -94,24 +112,121 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
+# --geo-fetch / --geo-status: the city database behind state selection
+# ---------------------------------------------------------------------------
+def _human(size: int) -> str:
+    """`121.1 MB` -- file sizes nobody has to convert in their head."""
+    return f"{size / 1_048_576:.1f} MB"
+
+
+def run_geo_status() -> int:
+    """Print what geo data this machine can answer with, then exit."""
+    import geodb
+
+    country = geodb.source()
+    print(f"{'country':8} "
+          f"{'ok      ' if geodb.available() else 'missing '} {country}")
+    info = geodb.city_status()
+    if info["available"]:
+        when = time.strftime("%Y-%m-%d", time.localtime(info["updated"])) \
+            if info.get("updated") else "unknown date"
+        print(f"{'state':8} ok       {info['path']} "
+              f"({_human(info['size'])}, {when})")
+        print("\nstate selection (--state, the panel's State column) works.")
+    else:
+        print(f"{'state':8} missing  -- state/province selection is "
+              "unavailable")
+        print("\nget it once with `python3 run.py --geo-fetch` "
+              "(or the panel's Settings dialog);\nlookups are offline "
+              "from then on.")
+    return 0
+
+
+def run_geo_fetch() -> int:
+    """Download the city/state database once, then exit."""
+    import geodb
+
+    info = geodb.city_status()
+    if info["available"]:
+        print(f"already installed: {info['path']} "
+              f"({_human(info['size'])}) -- fetching a fresh copy")
+
+    def progress(done: int, total: int) -> None:
+        pct = f" ({100 * done // total}%)" if total else ""
+        print(f"\r  {_human(done)}"
+              + (f" / {_human(total)}" if total else "") + pct,
+              end="", flush=True)
+
+    try:
+        path = geodb.fetch_city_db(progress=progress)
+    except Exception as exc:                       # noqa: BLE001
+        print(f"\nerror: {exc}", file=sys.stderr)
+        return 1
+    print()
+    print(f"installed {path} ({_human(path.stat().st_size)})")
+    print("state selection is ready -- try `python3 run.py --check "
+          "--state California`")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # --check
 # ---------------------------------------------------------------------------
+def _in_exit_scope(engine):
+    """Predicate over `engine.nodes()` rows: inside the chosen exit scope.
+
+    Region / country / state are resolved against the whole pool first
+    (the engine rejects a choice that is not in it), so by the time this
+    runs at least one row matches -- an empty answer here would be a bug,
+    not an empty report.
+    """
+    region, code, state = engine.region, engine.country, engine.state
+
+    def keep(node) -> bool:
+        if region and region_of(node["cc"]) != region:
+            return False
+        if code and node["cc"] != code:
+            return False
+        if state:
+            name = str(node.get("state") or "")
+            short = str(node.get("state_code") or "")
+            if not ((name and name.lower() == state.lower())
+                    or (short and short.upper() == state.upper())):
+                return False
+        return True
+
+    return keep
+
+
 def run_check(args) -> int:
     labels = args.proxy or list(PROXY_LIST)
     engine = RotatingProxy(proxies=labels, probe_timeout=4.0)
-    if args.country:
-        # resolve the name/code against the pool we just built, then drop
-        # everything outside it so the probe only covers that country
+    # widest level first, the same order as the panel's cascade: every
+    # choice is validated against the full pool before anything is dropped
+    for flag, apply, value in (("--region", engine.set_region, args.region),
+                               ("--country", engine.set_country, args.country),
+                               ("--state", engine.set_state, args.state)):
+        if not value:
+            continue
         try:
-            engine.set_country(args.country)
+            apply(value)
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            print(f"error: {flag}: {exc}", file=sys.stderr)
             return 1
-        want = engine.country
-        engine.set_proxies([n["label"] for n in engine.nodes()
-                            if n["cc"] == want])
-        print(f"Exit country: {want} "
-              f"({len(engine.proxies())} upstreams)")
+    if engine.region or engine.country or engine.state:
+        # then drop everything outside it, so the probe (and the report
+        # below) only covers the exits that would really be used
+        keep = _in_exit_scope(engine)
+        engine.set_proxies([n["label"] for n in engine.nodes() if keep(n)])
+        if not engine.proxies():
+            # nothing in scope: say which scope did it instead of probing
+            # an empty list and printing an empty table
+            print(f"error: no upstream in {engine.exit_place}",
+                  file=sys.stderr)
+            return 1
+        count = len(engine.proxies())
+        print(f"Exit: {engine.exit_place} — {count} upstream"
+              f"{'' if count == 1 else 's'}")
     try:
         engine.configure(use_only=args.use)
     except ValueError as exc:
@@ -200,11 +315,15 @@ def run_cli(args) -> int:
 
     engine._log_cb = log
 
-    if args.country:
+    for flag, apply, value in (("--region", engine.set_region, args.region),
+                               ("--country", engine.set_country, args.country),
+                               ("--state", engine.set_state, args.state)):
+        if not value:
+            continue
         try:
-            engine.set_country(args.country)
+            apply(value)
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            print(f"error: {flag}: {exc}", file=sys.stderr)
             return 1
     if args.https_only is not None:
         try:
@@ -226,7 +345,8 @@ def run_cli(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    scope = (f"  exit:   {engine.country}\n" if engine.country else "")
+    place = engine.exit_place
+    scope = (f"  exit:   {place}\n" if place else "")
     tunnel = ("  https:  only upstreams that can tunnel\n"
               if engine.https_only else "")
     route = ""
@@ -285,11 +405,21 @@ def run_gui(args) -> int:
                 app.engine.configure(**{key: value})
             except (RuntimeError, ValueError) as exc:
                 print(f"ignoring --{key}: {exc}", file=sys.stderr)
+    if args.region:
+        try:
+            app.engine.set_region(args.region)
+        except ValueError as exc:
+            print(f"ignoring --region: {exc}", file=sys.stderr)
     if args.country:
         try:
             app.engine.set_country(args.country)
         except ValueError as exc:
             print(f"ignoring --country: {exc}", file=sys.stderr)
+    if args.state:
+        try:
+            app.engine.set_state(args.state)
+        except ValueError as exc:
+            print(f"ignoring --state: {exc}", file=sys.stderr)
     if args.https_only is not None:
         try:
             app.engine.set_https_only(args.https_only)
@@ -320,6 +450,10 @@ def run_gui(args) -> int:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.geo_status:
+        return run_geo_status()
+    if args.geo_fetch:
+        return run_geo_fetch()
     if args.check:
         return run_check(args)
     if args.cli:

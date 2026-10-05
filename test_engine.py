@@ -19,6 +19,22 @@ from engine import RotatingProxy, parse_proxy, _split_hostport
 
 FREE_PORT = ("127.0.0.1", 0)
 
+# The engine's probes always dial "example.com" -- that name is the
+# subject of the handshake, not of the test.  Reaching the real one made
+# the suite depend on the network: the mocks' DNS lookup goes through the
+# resolver like any other process, and a resolver that stalls for a couple
+# of seconds pushed a probe past its 4 s budget and failed the health
+# checks at random.  The name therefore resolves to the local target
+# server, which is what the header of this file promises anyway.
+_TARGET_PORT = 0
+
+
+def _dial_upstream(host: str, port: int, timeout: float = 5) -> socket.socket:
+    """Connect where an upstream proxy would: locally for `example.com`."""
+    if host == "example.com" and _TARGET_PORT:
+        host, port = "127.0.0.1", _TARGET_PORT
+    return socket.create_connection((host, port), timeout=timeout)
+
 
 # ---------------------------------------------------------------------------
 # local target: answers GET and POST
@@ -105,7 +121,7 @@ def mock_upstream(sock: socket.socket, alive: bool = True,
 
         if method == "CONNECT":
             host, port = _split_hostport(target, 443)
-            upstream = socket.create_connection((host, port), timeout=5)
+            upstream = _dial_upstream(host, port)
             sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n" + early)
             _pump(sock, upstream)
             upstream.close()
@@ -115,7 +131,7 @@ def mock_upstream(sock: socket.socket, alive: bool = True,
         rest = target.split("://", 1)[1]
         authority, _, path = rest.partition("/")
         host, port = _split_hostport(authority, 80)
-        upstream = socket.create_connection((host, port), timeout=5)
+        upstream = _dial_upstream(host, port)
 
         # forward headers, then any body already buffered with them
         marker = head.find(b"\r\n\r\n")
@@ -205,7 +221,7 @@ def socks_session(sock, version: int) -> None:
             host = socket.inet_ntoa(ip)
             if ip[:3] == b"\x00\x00\x00" and ip[3] != 0:          # SOCKS4a
                 host = _read_cstring(sock).decode()
-            up = socket.create_connection((host, port), timeout=5)
+            up = _dial_upstream(host, port)
             sock.sendall(b"\x00\x5a" + hdr[2:8])                  # granted
         else:
             ver, n = _read_exact(sock, 2)
@@ -221,7 +237,7 @@ def socks_session(sock, version: int) -> None:
                 _read_exact(sock, 16)
                 host = "::1"
             port = int.from_bytes(_read_exact(sock, 2), "big")
-            up = socket.create_connection((host, port), timeout=5)
+            up = _dial_upstream(host, port)
             sock.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)       # succeeded
         _pump(sock, up)
     except OSError:
@@ -776,6 +792,195 @@ def test_country():
         geodb.lookup = real
 
 
+def test_region_state():
+    print("\nexit region / state selection")
+    import geodb
+    from engine import RotatingProxy, normalize_region
+
+    # -- region names normalise, junk is rejected -------------------------
+    check("region by name", normalize_region("europe") == "Europe")
+    check("region keeps its spelling", normalize_region("NORTH AMERICA")
+          == "North America")
+    check("region empty means anywhere",
+          normalize_region("") == "" and normalize_region("any") == ""
+          and normalize_region("Anywhere") == "")
+    try:
+        normalize_region("Middle Earth")
+        check("unknown region rejected", False, "no error raised")
+    except ValueError:
+        check("unknown region rejected", True)
+
+    real_lookup, real_locate = geodb.lookup, geodb.locate
+    GEO = {"9.9.9.9": ("DE", "Germany"), "8.8.8.8": ("US", "United States"),
+           "1.1.1.1": ("AU", "Australia"), "10.0.0.1": ("US", "United States")}
+    STATE = {"9.9.9.9": ("Berlin", "", "Berlin"),
+             "8.8.8.8": ("California", "", "Mountain View"),
+             "1.1.1.1": ("New South Wales", "", "Sydney"),
+             "10.0.0.1": ("Texas", "", "Dallas")}
+    geodb.lookup = lambda h: GEO.get(h, ("", ""))
+    geodb.locate = lambda h: STATE.get(h, ("", "", ""))
+    try:
+        eng = RotatingProxy(logger=quiet,
+                            proxies=["9.9.9.9:8080", "8.8.8.8:8080",
+                                     "1.1.1.1:8080", "10.0.0.1:8080"])
+        got = {n["label"]: n["state"] for n in eng.nodes()}
+        check("pool tagged with states",
+              got == {"9.9.9.9:8080": "Berlin", "8.8.8.8:8080": "California",
+                      "1.1.1.1:8080": "New South Wales",
+                      "10.0.0.1:8080": "Texas"}, str(got))
+        for n in eng._nodes:
+            n.status = "alive"
+        check("nothing scoped at the start",
+              eng.region == "" and eng.state == "" and eng.country == "")
+        check("free pool offers everyone", len(eng._candidates()) == 4,
+              str([n.label for n in eng._candidates()]))
+
+        # -- region ------------------------------------------------------
+        eng.set_region("europe")
+        check("set_region by name", eng.region == "Europe", eng.region)
+        check("candidates inside the region",
+              {n.label for n in eng._candidates()} == {"9.9.9.9:8080"},
+              str([n.label for n in eng._candidates()]))
+        check("scope note names the region",
+              eng.snapshot()["scope"] == "exit Europe",
+              str(eng.snapshot().get("scope")))
+
+        # a country outside the current region is not offered
+        eng.set_country("DE")
+        check("country inside the region accepted", eng.country == "DE")
+        try:
+            eng.set_country("US")
+            check("country outside the region rejected", False,
+                  "no error raised")
+        except ValueError:
+            check("country outside the region rejected", True)
+
+        # -- state -------------------------------------------------------
+        eng.set_state("berlin")
+        check("set_state by name", eng.state == "Berlin", eng.state)
+        check("candidates inside the state",
+              {n.label for n in eng._candidates()} == {"9.9.9.9:8080"},
+              str([n.label for n in eng._candidates()]))
+        check("scope note names the state",
+              eng.snapshot()["scope"] == "exit Berlin, Germany (DE)",
+              str(eng.snapshot().get("scope")))
+        try:
+            eng.set_state("Texas")
+            check("state outside the country rejected", False,
+                  "no error raised")
+        except ValueError:
+            check("state outside the country rejected", True)
+        check("set_state is idempotent", eng.set_state("Berlin") == "Berlin")
+
+        # -- switching region drops what no longer fits -------------------
+        eng.set_region("North America")
+        check("region switch clears country and state",
+              eng.region == "North America" and eng.country == ""
+              and eng.state == "", f"{eng.region} {eng.country} {eng.state}")
+        check("candidates follow the new region",
+              {n.label for n in eng._candidates()}
+              == {"8.8.8.8:8080", "10.0.0.1:8080"},
+              str([n.label for n in eng._candidates()]))
+        eng.set_country("US")
+        eng.set_state("Texas")
+        check("state narrows the region",
+              {n.label for n in eng._candidates()} == {"10.0.0.1:8080"},
+              str([n.label for n in eng._candidates()]))
+        eng.set_state("")
+        eng.set_country("")
+        eng.set_region("")
+
+        # -- an empty geographic scope still fails honestly ---------------
+        logs: list = []
+        scoped = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                               proxies=["1.1.1.1:8080"])
+        for n in scoped._nodes:
+            n.status = "alive"
+        scoped.set_region("Europe")
+        check("empty region yields no candidate", scoped._candidates() == [],
+              str(scoped._candidates()))
+        check("empty region warned",
+              any("no upstream in Europe" in m and "502" in m
+                  for lvl, m in logs if lvl == "warn"), str(logs[-2:]))
+        check("empty region note",
+              scoped._no_upstream_note() == " [restricted to Europe]",
+              scoped._no_upstream_note())
+        eng.set_region("")
+        eng.set_proxies(["9.9.9.9:8080", "8.8.8.8:8080", "1.1.1.1:8080",
+                         "10.0.0.1:8080"])
+        for n in eng._nodes:
+            n.status = "alive"
+
+        # -- clearing works from every level ------------------------------
+        eng.set_region("Oceania")
+        check("clear the region", eng.set_region("") == ""
+              and eng.region == "")
+        eng2 = RotatingProxy(logger=quiet, proxies=["9.9.9.9:8080"])
+        eng2.set_state("Berlin")
+        check("clear the state", eng2.set_state("") == "" and eng2.state == "")
+
+        # -- a hand-edited state file must not be able to strand us --------
+        eng3 = RotatingProxy(logger=quiet, proxies=["9.9.9.9:8080"],
+                             region="Asia", country="DE")
+        check("contradictory scope keeps the country",
+              eng3.region == "" and eng3.country == "DE",
+              f"{eng3.region} {eng3.country}")
+        eng4 = RotatingProxy(logger=quiet, proxies=["9.9.9.9:8080"],
+                             region="Middle Earth")
+        check("junk region dropped at load", eng4.region == "",
+              eng4.region)
+        # configure() validates the same way
+        eng6 = RotatingProxy(logger=quiet, proxies=["9.9.9.9:8080"])
+        try:
+            eng6.configure(region="Narnia")
+            check("configure rejects a junk region", False, "no error raised")
+        except ValueError:
+            check("configure rejects a junk region", True)
+        check("configure accepts a real region",
+              eng6.configure(region="europe")["region"] == "Europe",
+              eng6.settings.get("region"))
+        check("configure trims the state",
+              eng6.configure(state="  California ")["state"] == "California",
+              eng6.settings.get("state"))
+
+        # -- a narrower level may never contradict a wider one ------------
+        eng.set_region("")
+        eng.set_country("")
+        eng.set_state("")
+        eng.set_state("Texas")
+        check("a state can stand on its own", eng.state == "Texas",
+              eng.state)
+        check("states offered follow the scope",
+              eng.snapshot()["pool_states"]
+              == {"Berlin": 1, "California": 1, "New South Wales": 1,
+                  "Texas": 1}, str(eng.snapshot().get("pool_states")))
+        eng.set_country("DE")
+        check("changing country clears a state it does not have",
+              eng.country == "DE" and eng.state == "",
+              f"{eng.country} {eng.state}")
+        check("the state offer narrows with the country",
+              eng.snapshot()["pool_states"] == {"Berlin": 1},
+              str(eng.snapshot().get("pool_states")))
+        eng.set_state("Berlin")
+        eng.set_region("Europe")                  # Germany is inside it
+        check("region keeps a state it contains",
+              eng.region == "Europe" and eng.state == "Berlin"
+              and eng.country == "DE",
+              f"{eng.region} {eng.country} {eng.state}")
+        try:
+            eng.set_state("Texas")
+            check("state outside the region refused", False,
+                  "no error raised")
+        except ValueError:
+            check("state outside the region refused", True)
+        eng.set_state("")
+        eng.set_country("")
+        eng.set_region("")
+    finally:
+        geodb.lookup = real_lookup
+        geodb.locate = real_locate
+
+
 def test_https_only():
     print("\nHTTPS-capable routing")
     import geodb
@@ -883,6 +1088,81 @@ def test_https_only():
         check("stopped again", not eng2.running)
     finally:
         geodb.lookup = real
+
+
+def test_mmdb_reader():
+    """The bundled state/city reader: stdlib only, offline, and faithful.
+
+    State scope ships `mmdb.py` instead of `python3-maxminddb` so the
+    feature exists on any machine.  When the reference binding happens to
+    be installed as well, both readers are compared record for record on
+    the real database; without a database the file-error paths are still
+    exercised so the suite stays hermetic.
+    """
+    print("\nbundled MMDB reader")
+    import tempfile
+    from pathlib import Path
+
+    import mmdb
+
+    with tempfile.TemporaryDirectory(prefix="mmdb-") as tmp:
+        junk = Path(tmp) / "junk.mmdb"
+        junk.write_bytes(b"this is not a database")
+        for name, path in (("missing database rejected",
+                            str(Path(tmp) / "nowhere.mmdb")),
+                           ("garbage database rejected", str(junk))):
+            try:
+                mmdb.open_database(path)
+                check(name, False, "no error raised")
+            except mmdb.InvalidDatabase:
+                check(name, True)
+
+    import geodb
+    db_path = Path(geodb.city_path())
+    if not db_path.exists():
+        check("city database read", True, "skipped: none installed")
+        return
+
+    with mmdb.open_database(str(db_path)) as db:
+        check("metadata read",
+              "city" in str(db.metadata.get("database_type", "")).lower()
+              and db.metadata.get("node_count", 0) > 0,
+              str({k: db.metadata.get(k)
+                   for k in ("database_type", "ip_version", "node_count")}))
+        record = db.get("8.8.8.8")
+        check("record decoded",
+              isinstance(record, dict)
+              and "subdivisions" in record
+              and record["subdivisions"][0]["names"]["en"],
+              str(record)[:160])
+        check("unrouted address reads as no data",
+              db.get("10.0.0.1") is None, str(db.get("10.0.0.1")))
+        try:
+            db.get("not-an-ip")
+            check("non-IP argument rejected", False, "no error raised")
+        except ValueError:
+            check("non-IP argument rejected", True)
+
+        # geodb's state scope sits on top of this reader
+        state, _code, city = geodb.locate("8.8.8.8")
+        check("state scope resolves through it",
+              state == "California" and bool(city),
+              f"{state=} {city=}")
+
+        # -- cross-check against the reference binding when it exists ----
+        try:
+            import maxminddb
+        except ImportError:
+            check("matches the reference reader", True,
+                  "skipped: maxminddb not installed")
+            return
+        probes = ["8.8.8.8", "1.1.1.1", "9.9.9.9", "208.67.222.222",
+                  "193.0.6.139", "2a00:1450:4001:80f::200e", "10.0.0.1"]
+        with maxminddb.open_database(str(db_path)) as ref:
+            for ip in probes:
+                ours, theirs = db.get(ip), ref.get(ip)
+                check(f"reference agrees for {ip}", ours == theirs,
+                      f"ours={str(ours)[:120]} theirs={str(theirs)[:120]}")
 
 
 def test_lifecycle():
@@ -1324,13 +1604,31 @@ def test_use_scope():
         check("flags normalised",
               eng.set_use(" SOCKS5 , socks5 ,strong ") == "socks5,strong")
 
-        # a scope nothing matches must warn, not crash
+        # `strong` is a *preference*: when nothing in scope has proven
+        # itself yet the request still goes out, through the best exit
+        # there is, instead of refusing every connection outright
         eng.set_use("http,strong")
-        check("empty scope yields no candidates",
-              eng._candidates() == [], str(eng._candidates()))
-        check("empty scope warned",
-              any("routing filter" in m and "502" in m
-                  for _, m in logs[-3:]), str(logs[-2:]))
+        check("strong falls back instead of refusing",
+              {n.label for n in eng._candidates()} == {"192.0.2.1:8080"},
+              str([n.label for n in eng._candidates()]))
+        check("fallback announced in the log",
+              any("falling back" in m for _, m in logs[-4:]),
+              str(logs[-3:]))
+        check("snapshot reports the fallback",
+              "strong" in eng.snapshot().get("scope_fallback", []),
+              str(eng.snapshot().get("scope_fallback")))
+        # …and `fast` behaves the same way
+        for n in eng._nodes:
+            n.latency = 900.0                     # nothing is fast any more
+        eng.set_use("fast")
+        check("fast falls back too",
+              len(eng._candidates()) > 0, str(eng._candidates()))
+        check("fast fallback reported",
+              "fast" in eng.snapshot().get("scope_fallback", []),
+              str(eng.snapshot().get("scope_fallback")))
+        for n, latency in zip(eng._nodes, latencies):
+            n.latency = latency
+        eng.set_use("")
 
         rejected = False
         try:
@@ -1360,6 +1658,19 @@ def test_use_scope():
         check("snapshot carries the scope",
               snap["use_only"] == "socks5" and "use socks5" in snap["scope"],
               f"{snap['use_only']!r} {snap['scope']!r}")
+
+        # the protocol chips are promises, not preferences: with no SOCKS
+        # upstream at all the request fails honestly rather than quietly
+        # leaving through HTTP
+        eng.set_proxies(["192.0.2.1:8080"])
+        for n in eng._nodes:
+            n.status = "alive"
+        eng.set_use("socks5")
+        check("protocol scope stays hard",
+              eng._candidates() == [], str(eng._candidates()))
+        check("hard empty scope warned",
+              any("routing filter" in m and "502" in m for _, m in logs[-6:]),
+              str(logs[-6:]))
     finally:
         eng.configure(use_only="", https_only=False)
 
@@ -1373,8 +1684,10 @@ def _free_port() -> int:
 
 
 def main():
+    global _TARGET_PORT
     target = start_target()
     target_port = target.server_address[1]
+    _TARGET_PORT = target_port        # example.com answers from here
     mock_port = start_mock(alive=True)
     reject_port = start_mock(reject_status="407")
     early_port = start_mock(early=b"EARLY-DATA")
@@ -1400,6 +1713,8 @@ def main():
         lambda: test_socks_health(socks4_port, socks5_port, dead_port),
         test_stats_and_list_ops,
         test_country,
+        test_region_state,
+        test_mmdb_reader,
         test_https_only,
         test_use_scope,
         lambda: test_rotate_on_block(target_port, mock_port),
