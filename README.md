@@ -76,11 +76,11 @@ Worth knowing:
 | `gui.py` | the Tkinter dashboard |
 | `proxyctl.py` | `./proxyctl` — points the shell, Firefox and browsers at the proxy |
 | `appstate.py` | where `proxy_state.json` lives (next to the scripts in a checkout, in the user's config directory once installed) |
-| `geodb.py` | offline IP → country lookup (GeoLite Country via `python3-geoip`) |
+| `geodb.py` | offline IP → country/state lookup (GeoIP2/DB-IP MMDB) and IP → network/ASN lookup (DB-IP ASN Lite) |
 | `proxylist.py` | the upstream list (300 HTTP + 300 SOCKS4) |
-| `test_engine.py` | 192 engine checks (local target + mock HTTP/SOCKS upstreams) |
-| `test_gui.py` | 135 dashboard checks (headless, run under `xvfb-run`) |
-| `test_proxyctl.py` | 115 `proxyctl` checks (runs entirely in a throwaway HOME) |
+| `test_engine.py` | 288 engine checks (local target + mock HTTP/SOCKS upstreams, TLS interceptor, echo host) |
+| `test_gui.py` | 204 dashboard checks (headless, run under `xvfb-run`) |
+| `test_proxyctl.py` | 119 `proxyctl` checks (runs entirely in a throwaway HOME) |
 | `packaging/` | PyInstaller spec, the installer sources for every platform (Inno Setup, deb, AppImage, pkg, APK, Termux script) and the generated icons |
 | `.github/workflows/release.yml` | runs the tests and publishes all installers when a `v*` tag is pushed |
 
@@ -130,6 +130,14 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
 --no-https-only        drop that restriction again
 --geo-status           print where the state/city database stands, then exit
 --geo-fetch            download that database once (offline afterwards)
+--asn-fetch            download the network (ASN) database once — the
+                       source of the hosting/VPN risk flags (offline after)
+--verify               ask every exit where its traffic really leaves and
+                       report country disagreements and risky networks,
+                       then exit (uses the saved exit scope unless one is
+                       given here)
+--force                with --verify: ask again even where an answer is
+                       already on record
 --use FLAGS            comma-separated routing scope from http, socks4,
                        socks5, strong, fast (empty = every upstream)
 --rotate-on CODES      comma-separated statuses that make a plain-HTTP
@@ -430,6 +438,64 @@ Every upstream carries more than alive/dead:
   `Type` sorts/groups HTTP vs SOCKS4 vs SOCKS5, and each row's health sweep
   keeps `Last check` / `Last error` current.
 
+## Verifying where traffic really leaves
+
+GeoIP says where an address *is*; it says nothing about where traffic sent
+to that address comes out. The panel can ask: **Proxy → Verify exits now**
+(or `python3 run.py --verify`) sends one small request to an echo host
+*through* each exit and takes the answer that comes back as the exit's real
+address.
+
+* **Egress proof** — the address the internet saw lands on the row
+  (`egress: 203.0.113.7 · United States` in the detail line) with a
+  timestamp. Each exit is asked once: a second run only asks the ones that
+  could not be reached the first time, and `--verify --force` asks
+  everyone again. The answer lives as long as the panel does — the state
+  file stores settings and the pool, not the proof, so a restart starts
+  from unproven.
+* **`geo≠`** — when the egress address resolves to a different country
+  than the exit's own record claims, the row is flagged: the *Status* cell
+  shows `Alive · geo≠` in place of the strength tier, the row turns amber,
+  the tally counts it (`… · 412 verified · 4 geo≠ · 89 risky`) and the
+  **Flagged** entry of the status dropdown lists exactly those rows. The
+  detail line spells it out (`egress: … ← leaves from another country`).
+* **`DC` / `VPN`** — who runs the network comes from the ASN database
+  (`python3 run.py --asn-fetch`, or the *Network (ASN) database* row in
+  Settings: one ~5 MB download, DB-IP ASN Lite, CC BY 4.0, read offline
+  afterwards). An address on a datacentre/cloud or a VPN provider's
+  network reads `Alive · DC`, `Alive · VPN` or `Alive · DC+VPN`, with
+  `AS15169 Google LLC (hosting)` in the detail line — those are exactly
+  the addresses Google and other services already distrust, whatever the
+  geolocation claims. The same flags appear in `--geo-status`.
+* **Nothing is invented** — an exit that cannot reach any echo host stays
+  *unproven*, never dead (its network flags still come from the offline
+  ASN database); a dead exit is never asked; and an organisation that
+  matches no known provider earns no flag — "no flag" means "nothing
+  matched", never "confirmed residential".
+* **What it does not do** — verification only asks the exit where it is.
+  It never registers accounts and never receives SMS, phone or e-mail
+  codes; there is no trustworthy public list of phone-verification ranges
+  to check against, so that stays out rather than being faked.
+
+`python3 run.py --verify` prints the same thing as a report:
+
+```
+Exit: United States (US) — 412 upstreams will be verified
+Verifying 412 exits (asking where traffic really leaves)…
+[14:22:07] [INFO ] verifying 412 exits (asking where traffic really leaves)…
+[14:22:19] [INFO ] exit verification done in 12.4s — 412 checked, 402 proved where they leave, 2 leave from another country, 89 sit on hosting/VPN networks
+
+402 of 412 proved where they leave (10 could not be asked)
+89 sit on networks services already distrust (71 hosting/datacenter, 18 VPN)
+
+2 leave from a different country than they claim:
+  198.51.101.4:8080                claims United States      leaves from 192.0.2.9 · Germany
+  198.51.102.8:3128                claims United States      leaves from 203.0.113.8 · China
+```
+
+(Without the ASN database the risk line is replaced by a note pointing at
+`python3 run.py --asn-fetch`, and the egress half still works.)
+
 ## Keeping the pool stocked
 
 Free proxies die constantly — a static list is dead within weeks, so the
@@ -475,23 +541,29 @@ full-width cards underneath.
   **Exit via** cascade (Region → Country → State), the **Use** row of
   routing chips (`HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`, `Strong`, `Fast`)
   and the filter row in its toolbar. The *Status* cell shows the strength
-  badge (`Alive · Strong`), addresses sort numerically (`10.0.0.2` ahead of
+  badge (`Alive · Strong`) — or, once the verification pass has something
+  to say, the flag that outranks it: `Alive · geo≠` (traffic leaves from
+  another country), `Alive · DC`, `Alive · VPN` or `Alive · DC+VPN`, with
+  the row tinted amber. Addresses sort numerically (`10.0.0.2` ahead of
   `10.0.0.10`) in every order — and in the default status view, equal ranks
   tiebreak by strength, then by address. Type `socks4` in the filter box to
   see just the SOCKS4 entries, `germany` for one country, `california` for
   one state, `europe` for the whole region, `strong` for the proven exits,
   and use the status dropdown to narrow it to
-  alive/dead/other/HTTPS/strong/fast. The tally says where traffic is
-  actually going: `600/600 alive · exit California, United States (US) ·
-  strong fallback`.
+  alive/dead/other/HTTPS/strong/fast/**flagged**. The tally says where
+  traffic is actually going: `600/600 alive · exit California, United
+  States (US) · strong fallback`, plus what verification found once you
+  ask (`… · 412 verified · 4 geo≠ · 89 risky`).
 * **Log** — timestamped engine log with level filtering and colour.
 * **Traffic** — rolling sparkline of requests and concurrent connections.
 * **Settings** — listen address, health-check interval, retries, timeouts,
   parallel probes, whether to also probe HTTPS tunnel support, the
   *Rotate exit on status* list behind the block-rotation feature, the
-  list-refresh URL(s)/interval behind the auto-restock feature, and the
+  list-refresh URL(s)/interval behind the auto-restock feature, the
   **state/city database** row (its size and build date, with **Refresh** to
-  download it once for state-level exit selection).
+  download it once for state-level exit selection) and the **network (ASN)
+  database** row beside it (same treatment, ~5 MB, the source of the
+  hosting/VPN risk flags behind *Verify exits now*).
 * **Apps** — the three switches described above, with their live status and a
   one-click *Point everything at this proxy* / *Take everything off*.
 
@@ -543,7 +615,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 572 checks
+That is the whole procedure: the `release` workflow runs the 611 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -559,12 +631,12 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 271 checks
-xvfb-run -a python3 test_gui.py        # 182 checks (needs a display or Xvfb)
+python3 test_engine.py                 # 288 checks
+xvfb-run -a python3 test_gui.py        # 204 checks (needs a display or Xvfb)
 python3 test_proxyctl.py               # 119 checks
 ```
 
-572 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+611 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
 cascade, country or HTTPS-only flag from a real session can never leak into
 the checks. The geo lookups the cascade tests need are stubbed, so the suite

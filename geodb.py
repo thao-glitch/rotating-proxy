@@ -31,6 +31,14 @@ itself stays offline:
     geodb.fetch_city_db()             -> PosixPath(..)  (one ~60 MB download)
     geodb.state("8.8.8.8")            -> ("California", "US-CA" or "")
     geodb.city_of("8.8.8.8")          -> "Mountain View"
+
+Who *runs* an address is the third layer, behind the exit risk flags: an
+ASN database, fetched the same way as the city one (`python3 run.py
+--asn-fetch` or the Settings dialog) and read offline afterwards:
+
+    geodb.asn_available()            -> True
+    geodb.fetch_asn_db()             -> PosixPath(..)  (one ~5 MB download)
+    geodb.asn_info("8.8.8.8")        -> (15169, "Google LLC")
 """
 
 from __future__ import annotations
@@ -77,6 +85,20 @@ LEGACY_CITY_PATHS = (
 _INSTALL_CITY_HINT = "download it once with the panel's Settings dialog " \
                      "or `python3 run.py --geo-fetch`"
 
+# where the ASN database lives: it says *what kind of network* an exit is
+# on (a hosting provider, a VPN service, a phone company), which is the
+# "is this address one services will trust?" half of exit verification
+ASN_FILENAME = "dbip-asn-lite.mmdb"
+ASN_URL = "https://download.db-ip.com/free/dbip-asn-lite-{ym}.mmdb.gz"
+ASN_SIZE_CAP = 256 * 1024 * 1024
+SYSTEM_ASN_PATHS = (
+    "/usr/share/GeoIP/dbip-asn-lite.mmdb",
+    "/usr/local/share/GeoIP/dbip-asn-lite.mmdb",
+    "/usr/share/GeoIP/GeoLite2-ASN.mmdb",
+    "/usr/local/share/GeoIP/GeoLite2-ASN.mmdb",
+)
+_INSTALL_ASN_HINT = "download it once with `python3 run.py --asn-fetch`"
+
 # GeoIP returns these for addresses it cannot place
 _UNKNOWN = {"", "--", "n/a", "na", "none", "null"}
 
@@ -87,6 +109,9 @@ _CACHE: dict[str, tuple[str, str]] = {}
 _CITY = None
 _CITY_TRIED = False
 _CITY_CACHE: dict[str, tuple[str, str, str]] = {}   # host -> (state, code, city)
+_ASN = None
+_ASN_TRIED = False
+_ASN_CACHE: dict[str, tuple[int, str]] = {}         # host -> (asn, org)
 
 
 def _looks_like_ip(host: str) -> bool:
@@ -407,8 +432,8 @@ def fetch_city_db(url: str | None = None, *, progress=None,
 
 
 def _download(url: str, target: Path, *, progress=None,
-              timeout: float = 300.0) -> None:
-    """Stream `url` into `target`, capped at CITY_SIZE_CAP."""
+              timeout: float = 300.0, cap: int = CITY_SIZE_CAP) -> None:
+    """Stream `url` into `target`, capped at `cap` bytes."""
     req = urllib.request.Request(
         url, headers={"User-Agent": "RotatingProxy/1.0 (geo database)"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -420,14 +445,15 @@ def _download(url: str, target: Path, *, progress=None,
                 if not chunk:
                     break
                 done += len(chunk)
-                if done > CITY_SIZE_CAP:
-                    raise OSError("city database is larger than expected")
+                if done > cap:
+                    raise OSError("downloaded file is larger than expected")
                 fh.write(chunk)
                 if progress:
                     progress(done, total)
 
 
-def _decompress(gz_path: Path, target: Path) -> None:
+def _decompress(gz_path: Path, target: Path,
+                *, cap: int = CITY_SIZE_CAP) -> None:
     """Gunzip `gz_path` into `target`, again with a size cap."""
     done = 0
     with gzip.open(gz_path, "rb") as src, target.open("wb") as out:
@@ -436,8 +462,8 @@ def _decompress(gz_path: Path, target: Path) -> None:
             if not chunk:
                 break
             done += len(chunk)
-            if done > CITY_SIZE_CAP:
-                raise OSError("city database is larger than expected")
+            if done > cap:
+                raise OSError("downloaded file is larger than expected")
             out.write(chunk)
 
 
@@ -468,18 +494,181 @@ def remove_city_db() -> bool:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# ASN database: what *kind* of network an address sits on
+# ---------------------------------------------------------------------------
+# Exit verification asks two different questions about an address: where is
+# it (city database, above) and who runs it (here).  The answer to the
+# second is what tells a hosting/VPN exit -- the kind of address Google and
+# friends already distrust -- apart from an ordinary one.
+def asn_path() -> Path:
+    """Where `fetch_asn_db()` puts the database."""
+    return geo_dir() / ASN_FILENAME
+
+
+def asn_paths() -> tuple:
+    """Every place an ASN database could already be (ours first)."""
+    return (asn_path(), *(Path(p) for p in SYSTEM_ASN_PATHS))
+
+
+def asn_db_urls(when: date | None = None) -> list[str]:
+    """Candidate download URLs: this month's DB-IP release, then last's."""
+    today = when or date.today()
+    first = today.replace(day=1)
+    previous = (first - timedelta(days=1)).replace(day=1)
+    return [ASN_URL.format(ym=today.strftime("%Y-%m")),
+            ASN_URL.format(ym=previous.strftime("%Y-%m"))]
+
+
+def _open_asn():
+    """Open the ASN database once, lazily and thread-safely."""
+    global _ASN, _ASN_TRIED
+    with _RLock:
+        if _ASN_TRIED:
+            return _ASN
+        _ASN_TRIED = True
+        import mmdb
+        for path in asn_paths():
+            if not os.path.isfile(path):
+                continue
+            try:
+                _ASN = mmdb.open_database(str(path))
+            except Exception:
+                continue
+            break
+        return _ASN
+
+
+def asn_available() -> bool:
+    """True when network/organisation data can actually be resolved."""
+    return _open_asn() is not None
+
+
+def asn_source() -> str:
+    """A short human description of where ASN data comes from."""
+    db = _open_asn()
+    if db is None:
+        return _INSTALL_ASN_HINT
+    return str(getattr(db, "path", "") or asn_path())
+
+
+def asn_status() -> dict:
+    """Everything the Settings dialog needs to describe the ASN database."""
+    db = _open_asn()
+    path = next((p for p in asn_paths() if p.is_file()), None)
+    info = {"available": db is not None,
+            "path": str(path) if path else str(asn_path()),
+            "size": path.stat().st_size if path else 0,
+            "updated": 0.0}
+    if db is not None and isinstance(getattr(db, "metadata", None), dict):
+        info["updated"] = float(db.metadata.get("build_epoch") or 0)
+    elif path is not None:
+        try:
+            info["updated"] = path.stat().st_mtime
+        except OSError:
+            pass
+    return info
+
+
+def asn_info(host: str) -> tuple[int, str]:
+    """`(number, organisation)` for an address; `(0, "")` when unknown.
+
+    Needs the ASN database (`run.py --asn-fetch`): like the city database
+    it is downloaded once and read offline afterwards.  Unknown addresses
+    answer `(0, "")` rather than raising, so a missing or broken file just
+    means "no network data" for that row.
+    """
+    if not _looks_like_ip(host):
+        return 0, ""
+    with _RLock:
+        hit = _ASN_CACHE.get(host)
+    if hit is not None:
+        return hit
+    record = None
+    db = _open_asn()
+    if db is not None:
+        try:
+            record = db.get(host)
+        except Exception:
+            record = None
+    number, org = 0, ""
+    if isinstance(record, dict):
+        try:
+            number = int(record.get("autonomous_system_number") or 0)
+        except (TypeError, ValueError):
+            number = 0
+        org = _clean(record.get("autonomous_system_organization"))
+    answer = (number, org)
+    with _RLock:
+        _ASN_CACHE[host] = answer
+    return answer
+
+
+def fetch_asn_db(url: str | None = None, *, progress=None,
+                 timeout: float = 300.0) -> Path:
+    """Download the ASN database once and install it.
+
+    Same contract as `fetch_city_db`: `progress(done, total)` for a panel
+    bar, the file is opened before it replaces anything, lookups stay
+    offline afterwards, and `OSError` is raised when every source failed.
+    """
+    dest = asn_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    urls = [url] if url else asn_db_urls()
+    errors = []
+    for candidate in urls:
+        gz = dest.with_suffix(".gz.part")
+        part = dest.with_suffix(".part")
+        try:
+            _download(candidate, gz, progress=progress, timeout=timeout,
+                      cap=ASN_SIZE_CAP)
+            _decompress(gz, part, cap=ASN_SIZE_CAP)
+            _validate(part)                      # same shape, same checks
+            os.replace(part, dest)
+        except Exception as exc:                 # noqa: BLE001
+            errors.append(f"{candidate}: {exc}")
+            gz.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
+            continue
+        finally:
+            gz.unlink(missing_ok=True)
+        reset()                                  # drop stale handles/caches
+        return dest
+    raise OSError("no ASN database could be fetched -- " + "; ".join(errors))
+
+
+def remove_asn_db() -> bool:
+    """Delete the downloaded ASN database (risk flags go empty again)."""
+    removed = False
+    for path in (asn_path(), asn_path().with_suffix(".part"),
+                 asn_path().with_suffix(".gz.part")):
+        try:
+            if path.is_file():
+                path.unlink()
+                removed = True
+        except OSError:
+            pass
+    if removed:
+        reset()
+    return removed
+
+
 def reset() -> None:
     """Forget every database handle and every cached answer."""
-    global _DB, _TRIED, _CITY, _CITY_TRIED
+    global _DB, _TRIED, _CITY, _CITY_TRIED, _ASN, _ASN_TRIED
     with _RLock:
         _CACHE.clear()
         _CITY_CACHE.clear()
+        _ASN_CACHE.clear()
         _DB = None
         _TRIED = False
         db, _CITY = _CITY, None
         _CITY_TRIED = False
-    if db is not None:
-        try:
-            db.close()
-        except Exception:                       # noqa: BLE001
-            pass
+        asn, _ASN = _ASN, None
+        _ASN_TRIED = False
+    for handle in (db, asn):
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:                   # noqa: BLE001
+                pass

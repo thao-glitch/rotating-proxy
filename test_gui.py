@@ -901,6 +901,125 @@ def test_exit_cascade(app):
         app._render_pool(force=True)
 
 
+def test_verification_ui(app):
+    """Exit verification as the panel shows it: badge, colour, tally,
+    filter, detail line -- and the menu action that starts a pass."""
+    print("\nexit verification in the panel")
+    import engine
+    import time as _time
+
+    # ---- the badge itself, independent of the table ----------------------
+    check("clean exit keeps its tier",
+          gui._live_badge({"strength": "Strong"}) == "Alive · Strong",
+          gui._live_badge({"strength": "Strong"}))
+    check("mismatch outranks the tier",
+          gui._live_badge({"strength": "Strong", "mismatch": True})
+          == "Alive · geo≠",
+          gui._live_badge({"strength": "Strong", "mismatch": True}))
+    check("hosting network reads as DC",
+          gui._live_badge({"risk": ("hosting",)}) == "Alive · DC",
+          gui._live_badge({"risk": ("hosting",)}))
+    check("vpn network reads as VPN",
+          gui._live_badge({"risk": ("vpn",)}) == "Alive · VPN",
+          gui._live_badge({"risk": ("vpn",)}))
+    check("both risks fit in one badge",
+          gui._live_badge({"risk": ("hosting", "vpn")}) == "Alive · DC+VPN",
+          gui._live_badge({"risk": ("hosting", "vpn")}))
+    samples = [{"strength": "Strong"}, {"mismatch": True},
+               {"risk": ("hosting", "vpn")}, {"risk": ("vpn",)},
+               {"strength": "New", "mismatch": True}]
+    check("every badge fits the 98 px column (14 chars)",
+          all(len(gui._live_badge(n)) <= 14 for n in samples),
+          str([gui._live_badge(n) for n in samples]))
+    check("flags are found for colour and filtering",
+          gui._flags_of({"mismatch": True, "risk": ["hosting"]})
+          == ("geo", "dc"),
+          str(gui._flags_of({"mismatch": True, "risk": ["hosting"]})))
+    check("a clean row carries no flags",
+          gui._flags_of({"risk": []}) == (), str(gui._flags_of({"risk": []})))
+    check("flagged alive rows get the colour",
+          gui.ProxyGUI._tags_of({"status": "alive", "mismatch": True}, True)
+          == ("alive", "flag", "zebra"),
+          str(gui.ProxyGUI._tags_of({"status": "alive", "mismatch": True},
+                                    True)))
+    check("dead rows stay red, flags would only say less",
+          gui.ProxyGUI._tags_of({"status": "dead", "mismatch": True}, True)
+          == ("dead", "zebra"),
+          str(gui.ProxyGUI._tags_of({"status": "dead", "mismatch": True},
+                                    True)))
+
+    # ---- on the table ----------------------------------------------------
+    app.engine.set_proxies(["10.0.0.1:8080", "10.0.0.2:8080"])
+    app._filter_var.set("")
+    app._status_var.set("All")
+    pump(app, ticks=3)
+    nodes = {n.label: n for n in app.engine._nodes}
+    flagged_node = nodes["10.0.0.1:8080"]
+    # a completed pass: alive, claims Germany, leaves from Google's network
+    flagged_node.status = "alive"
+    flagged_node.cc = "DE"
+    flagged_node.egress_ip = "8.8.8.8"          # GeoIP knows it: United States
+    flagged_node.verified = _time.time()
+    flagged_node.asn, flagged_node.asn_org = 15169, "Google LLC"
+    flagged_node.risk = ("hosting",)
+    app._render_pool(force=True)
+    values = app.tree.item("10.0.0.1:8080", "values")
+    check("flagged row shows the verification badge",
+          values[4] == "Alive · geo≠", str(values[4]))
+    check("flagged row is coloured",
+          "flag" in app.tree.item("10.0.0.1:8080", "tags"),
+          str(app.tree.item("10.0.0.1:8080", "tags")))
+    check("the other row is untouched",
+          "flag" not in app.tree.item("10.0.0.2:8080", "tags"),
+          str(app.tree.item("10.0.0.2:8080", "tags")))
+    tally = app.pool_count.cget("text")
+    check("tally counts what the pass proved",
+          "1 verified" in tally and "1 geo≠" in tally and "1 risky" in tally,
+          tally)
+
+    # ---- the Flagged filter ---------------------------------------------
+    app._status_var.set("Flagged")
+    app._render_pool(force=True)
+    check("Flagged filter keeps only flagged rows",
+          list(app.tree.get_children()) == ["10.0.0.1:8080"],
+          str(app.tree.get_children()))
+    app._status_var.set("All")
+    app._render_pool(force=True)
+
+    # ---- the detail line -------------------------------------------------
+    app.tree.selection_set("10.0.0.1:8080")
+    app._on_select()
+    text = app.detail.cget("text")
+    check("detail line names the egress address",
+          "egress:" in text and "8.8.8.8" in text, text)
+    check("detail line says the country disagrees",
+          "another country" in text, text)
+    check("detail line names the network and its flag",
+          "AS15169" in text and "hosting" in text, text)
+
+    # ---- the menu action -------------------------------------------------
+    real_urls = engine._ECHO_URLS
+    engine._ECHO_URLS = ()                       # nothing may reach the net
+    try:
+        stale = nodes["10.0.0.2:8080"]
+        stale.risk = ("vpn",)                    # a flag from an older run
+        app._verify_now()
+        done = wait_until(lambda: "exit verification done"
+                          in app.log_text.get("1.0", "end"), app, timeout=15)
+        check("Verify exits now runs a pass to completion", done,
+              app.log_text.get("1.0", "end")[-300:])
+        check("the pass left no work running",
+              not app.engine.snapshot()["verifying"],
+              str(app.engine.snapshot()["verifying"]))
+        check("the pass refreshes the flags of exits it asks",
+              stale.risk == (), str(stale.risk))
+        check("an exit with a proof on record is left alone",
+              flagged_node.risk == ("hosting",), str(flagged_node.risk))
+    finally:
+        engine._ECHO_URLS = real_urls
+    app.tree.selection_remove(app.tree.selection())
+
+
 def test_engine_via_gui(app, target_port, mock_port):
     print("\nlifecycle driven from the UI")
     app.engine.set_proxies([f"127.0.0.1:{mock_port}"])
@@ -1070,6 +1189,7 @@ def main():
         test_use_chips(app)
         test_categories(app)
         test_exit_cascade(app)
+        test_verification_ui(app)
         test_log(app)
         test_dialogs(app)
         test_every_button(app)

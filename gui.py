@@ -209,6 +209,8 @@ class ProxyGUI(tk.Tk):
         self._state_values: dict[str, str] = {"Anywhere": ""}
         self._state_choices: tuple = ()
         self._geo_busy = False
+        self._asn_busy = False
+        self._was_verifying = False        # edge-triggered status line
         self._https_var = tk.BooleanVar(value=False)
         self._level_var = tk.StringVar(value="Info & up")
         self._auto_scroll = tk.BooleanVar(value=True)
@@ -340,6 +342,7 @@ class ProxyGUI(tk.Tk):
         proxm.add_command(label="Stop", command=self._stop)
         proxm.add_separator()
         proxm.add_command(label="Check health now", command=self._check_now)
+        proxm.add_command(label="Verify exits now", command=self._verify_now)
         proxm.add_command(label="Refresh proxy list now",
                           command=self._refresh_list_now)
         proxm.add_command(label="Settings…", command=self._open_settings)
@@ -501,7 +504,7 @@ class ProxyGUI(tk.Tk):
         combo = ttk.Combobox(filt, textvariable=self._status_var, width=10,
                              state="readonly",
                              values=["All", "Alive", "Dead", "Other", "HTTPS",
-                                     "Strong", "Fast"])
+                                     "Strong", "Fast", "Flagged"])
         combo.pack(side="left", padx=(0, 6))
         combo.bind("<<ComboboxSelected>>", lambda e: self._render_pool(force=True))
         self.pool_count = tk.Label(filt, text="", bg=PANEL_2, fg=MUTED,
@@ -529,10 +532,11 @@ class ProxyGUI(tk.Tk):
             self.tree.column(col, width=width, anchor=anchor,
                              minwidth=44, stretch=(col in ("proxy", "error")))
         # healthy rows stay neutral like the commercial tables; only
-        # trouble (dead/checking) and the zebra striping get a colour
+        # trouble (dead/checking), the verification flags and the zebra
+        # striping get a colour
         for tag, colour in (("alive", TEXT), ("dead", RED),
                             ("checking", AMBER), ("unknown", TEXT),
-                            ("zebra", "#fafbfd")):
+                            ("flag", AMBER), ("zebra", "#fafbfd")):
             self.tree.tag_configure(tag, foreground=colour)
         self.tree.tag_configure("zebra", background="#fafbfd")
 
@@ -614,6 +618,9 @@ class ProxyGUI(tk.Tk):
         # the Settings dialog's city-database row (created when it opens)
         self.geo_status = None
         self.geo_btn = None
+        # …and its network/ASN row, behind the exit risk flags
+        self.asn_status = None
+        self.asn_btn = None
 
     # -------------------------------------------------------------- state
     @staticmethod
@@ -737,6 +744,10 @@ class ProxyGUI(tk.Tk):
                 self._geo_progress(item[1])
             elif item[0] == "geo-done":
                 self._geo_finished(item[1], item[2])
+            elif item[0] == "asn":
+                self._asn_progress(item[1])
+            elif item[0] == "asn-done":
+                self._asn_finished(item[1], item[2])
             elif item[0] == "op":
                 _, error, on_done = item
                 self._busy = False
@@ -770,6 +781,17 @@ class ProxyGUI(tk.Tk):
             return
         self.engine.check_now(reason="manual")
         self.status_var.set("Health check running…")
+
+    def _verify_now(self):
+        """Ask every exit that is not dead where traffic really leaves.
+
+        The answer is kept on the row, so a second run only asks the
+        exits that could not be reached the first time -- use
+        `python3 run.py --verify --force` to ask everyone again.
+        """
+        if self.engine.verify_now():
+            self.status_var.set("Verifying exits (asking where traffic "
+                                "really leaves)…")
 
     def _refresh_list_now(self):
         """Pull the configured proxy lists right now (Proxy menu)."""
@@ -807,6 +829,11 @@ class ProxyGUI(tk.Tk):
         if choice == "Fast":
             latency = node.get("latency")
             return latency is not None and latency <= FAST_MS
+        if choice == "Flagged":
+            # the verification pass has something to say about this exit:
+            # it leaves from somewhere else, or from a network services
+            # already distrust
+            return bool(_flags_of(node))
         return status == "unknown"
 
     def _sort_by(self, column: str):
@@ -876,9 +903,9 @@ class ProxyGUI(tk.Tk):
             if children:
                 self.tree.delete(*children)
             for idx, n in enumerate(visible):
-                tags = (n["status"], "zebra") if idx % 2 else (n["status"],)
                 self.tree.insert("", "end", iid=n["label"],
-                                 values=self._row_values(n), tags=tags)
+                                 values=self._row_values(n),
+                                 tags=self._tags_of(n, idx % 2 == 1))
             self._row_labels = labels
             keep = [l for l in labels if l in selected]
             if keep:
@@ -888,8 +915,8 @@ class ProxyGUI(tk.Tk):
             for idx, n in enumerate(visible):
                 values = self._row_values(n)
                 if self.tree.item(n["label"], "values") != values:
-                    tags = (n["status"], "zebra") if idx % 2 else (n["status"],)
-                    self.tree.item(n["label"], values=values, tags=tags)
+                    self.tree.item(n["label"], values=values,
+                                   tags=self._tags_of(n, idx % 2 == 1))
 
         alive = sum(1 for n in nodes if n["status"] == "alive")
         socks = sum(1 for n in nodes if n.get("proto") != "http")
@@ -906,6 +933,15 @@ class ProxyGUI(tk.Tk):
             tally.append(f"{strong} strong")
         if fast:
             tally.append(f"{fast} fast")
+        verified = sum(1 for n in nodes if n.get("verified"))
+        if verified:
+            tally.append(f"{verified} verified")
+        mismatch = sum(1 for n in nodes if n.get("mismatch"))
+        if mismatch:
+            tally.append(f"{mismatch} geo≠")
+        risky = sum(1 for n in nodes if n.get("risk"))
+        if risky:
+            tally.append(f"{risky} risky")
         place = self.engine.exit_place
         if place:
             tally.append(f"exit {place}")
@@ -1167,11 +1203,20 @@ class ProxyGUI(tk.Tk):
 
         The status cell doubles as the strength badge: "Alive · Strong" is
         the tier users actually filter and sort on, and the Treeview can
-        only colour whole rows, not individual cells."""
+        only colour whole rows, not individual cells.
+
+        Verification speaks through the same cell, and only when it has
+        something to say: a proven mismatch or a hosting/VPN network
+        replaces the tier (98 px buys 14 characters, and knowing your
+        traffic leaves from somewhere else beats knowing the tier -- which
+        the detail line still carries).  The tokens are deliberately
+        short: geo≠ = traffic leaves from another country, DC = datacentre
+        or cloud address, VPN = the ASN calls itself a VPN.
+        """
         latency = "—" if n["latency"] is None else f"{n['latency']:.0f} ms"
         status = n["status"]
         if status == "alive":
-            badge = f"Alive · {n.get('strength', 'New')}"
+            badge = _live_badge(n)
         elif status == "checking":
             badge = "Checking…"
         elif status == "dead":
@@ -1183,6 +1228,21 @@ class ProxyGUI(tk.Tk):
                 latency,
                 _ago(n["last_check"]), str(n["hits"]),
                 (n["last_error"] or "")[:70])
+
+    @staticmethod
+    def _tags_of(n: dict, striped: bool) -> tuple[str, ...]:
+        """Row colours: status, then the verification flag, then the zebra
+        background last so it can never hide a foreground colour.
+
+        Only alive rows get the flag colour -- a red dead row already says
+        everything, and amber on top of it would only say less.
+        """
+        tags = [n["status"]]
+        if n["status"] == "alive" and _flags_of(n):
+            tags.append("flag")
+        if striped:
+            tags.append("zebra")
+        return tuple(tags)
 
     def _on_select(self, _event=None):
         selection = self.tree.selection()
@@ -1212,6 +1272,16 @@ class ProxyGUI(tk.Tk):
                      f"last check: {_ago(n['last_check'])}"]
             if n.get("connect_ok") is not None:
                 parts.append("https: " + ("yes" if n["connect_ok"] else "no"))
+            if n.get("egress_ip"):
+                # what the verification pass proved, in the exit's own words
+                flag = ("  ← leaves from another country"
+                        if n.get("mismatch") else "")
+                parts.append(f"egress: {n.get('egress_label')}{flag}")
+            if n.get("asn_org") or n.get("asn"):
+                net = f"AS{n['asn']} {n['asn_org']}".strip()
+                if n.get("risk"):
+                    net += f" ({n['risk_label']})"
+                parts.append(f"network: {net}")
             if n.get("blocks"):
                 parts.append(f"blocked by targets: {n['blocks']}×")
             if n["last_error"]:
@@ -1385,6 +1455,8 @@ class ProxyGUI(tk.Tk):
         # status pill: soft tint behind a strong text colour
         if snap["status"] == "running" and snap["checking"]:
             pill_text, pill_bg, pill_fg = "● CHECKING", AMBER_TINT, AMBER
+        elif snap["status"] == "running" and snap.get("verifying"):
+            pill_text, pill_bg, pill_fg = "● VERIFYING", AMBER_TINT, AMBER
         elif snap["status"] == "running":
             pill_text, pill_bg, pill_fg = "● RUNNING", GREEN_TINT, GREEN
         elif snap["status"] == "starting":
@@ -1416,6 +1488,18 @@ class ProxyGUI(tk.Tk):
             self.progress.pack_forget()
         elif self.status_var.get().startswith(("Checking", "Health check")):
             self.status_var.set("")        # the sweep finished
+
+        # the verification pass reports through the log; the status line
+        # only says when it started and that it is over
+        verifying = bool(snap.get("verifying"))
+        if verifying != self._was_verifying:
+            if verifying:
+                self.status_var.set("Verifying exits (asking where traffic "
+                                    "really leaves)…")
+            else:
+                self.status_var.set("Exit verification finished — "
+                                    "see the log for the report")
+            self._was_verifying = verifying
 
         # traffic history
         rate = snap["served"] - self._prev_served
@@ -1552,6 +1636,69 @@ class ProxyGUI(tk.Tk):
         self._refresh_states(snap)
         self._render_pool(force=True)
 
+    # ---- the ASN database behind the exit risk flags ---------------------
+    @staticmethod
+    def _asn_status_text() -> str:
+        """One line for the Settings row: is the network database there?"""
+        import geodb
+
+        info = geodb.asn_status()
+        if not info["available"]:
+            return "not installed — risk flags stay empty"
+        size = f"{info['size'] / 1_048_576:.1f} MB"
+        when = (time.strftime("%Y-%m-%d", time.localtime(info["updated"]))
+                if info.get("updated") else "")
+        return "installed · " + " · ".join(x for x in (size, when) if x)
+
+    def _download_asn(self) -> None:
+        """Fetch the ASN database once -- in the background, like the city
+        one: the panel stays usable while it downloads, and worker threads
+        never touch Tk (progress travels through the log queue)."""
+        if self._asn_busy:
+            return
+        self._asn_busy = True
+        if self.asn_btn is not None:
+            self.asn_btn.configure(state="disabled", text="Downloading…")
+        self.status_var.set("Downloading the network (ASN) database…")
+
+        import geodb
+
+        def progress(done: int, total: int) -> None:
+            text = f"downloading… {done / 1_048_576:.1f} MB"
+            if total:
+                text += f" / {total / 1_048_576:.0f} MB ({100 * done // total}%)"
+            self._q.put(("asn", text))
+
+        def worker():
+            path, error = None, None
+            try:
+                path = geodb.fetch_asn_db(progress=progress)
+            except Exception as exc:                 # surface, don't crash
+                path, error = None, exc
+            self._q.put(("asn-done", path, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _asn_progress(self, text: str) -> None:
+        if self.asn_status is not None:
+            self.asn_status.set(text)
+
+    def _asn_finished(self, path, error) -> None:
+        self._asn_busy = False
+        if self.asn_status is not None:
+            self.asn_status.set(str(error) if error
+                                else self._asn_status_text())
+        if self.asn_btn is not None and self.asn_btn.winfo_exists():
+            self.asn_btn.configure(state="normal", text="Refresh")
+        if error is not None:
+            self.status_var.set(str(error))
+            self._append_log(time.time(), "error", f"ASN database: {error}")
+            return
+        self._append_log(time.time(), "info", f"network database installed: "
+                                              f"{path}")
+        self.status_var.set("Network database installed — run "
+                            "“Verify exits now” to apply the flags")
+
     def _open_settings(self):
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.lift()
@@ -1596,6 +1743,21 @@ class ProxyGUI(tk.Tk):
                                   command=self._download_geo)
         self.geo_btn.pack(side="right")
 
+        # ---- the database behind the exit risk flags ---------------------
+        installed_asn = geodb.asn_available()
+        net = tk.Frame(body, bg=BG)
+        net.pack(fill="x", pady=(6, 0))
+        tk.Label(net, text="Network (ASN) database", bg=BG, fg=TEXT,
+                 width=26, anchor="w").pack(side="left")
+        self.asn_status = tk.StringVar(value=self._asn_status_text())
+        tk.Label(net, textvariable=self.asn_status, bg=BG, fg=MUTED,
+                 font=F["small"], anchor="w").pack(side="left")
+        self.asn_btn = ttk.Button(net, width=10,
+                                  text="Refresh" if installed_asn
+                                  else "Download",
+                                  command=self._download_asn)
+        self.asn_btn.pack(side="right")
+
         note = ("Settings apply the next time you start the proxy.\n"
                 "The port change always requires a restart.\n"
                 "“Rotate exit on status” is a comma-separated list of the\n"
@@ -1607,7 +1769,10 @@ class ProxyGUI(tk.Tk):
                 "box of Exit via: one ~60 MB download (DB-IP City Lite, CC\n"
                 "BY 4.0) into "
                 f"{geodb.city_path().parent}, then every state\n"
-                "lookup is offline.")
+                "lookup is offline.\n"
+                "“Network (ASN) database” says who runs an exit's address\n"
+                "(one ~5 MB download, DB-IP ASN Lite, CC BY 4.0) and powers\n"
+                "the hosting/VPN risk flags of “Verify exits now”.\n")
         tk.Label(body, text=note, bg=BG, fg=MUTED, justify="left",
                  font=F["small"]).pack(anchor="w", pady=(12, 0))
 
@@ -1848,6 +2013,38 @@ def _duration(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02}:{m:02}:{s:02}" if h else f"{m:02}:{s:02}"
+
+
+def _live_badge(n: dict) -> str:
+    """"Alive · Strong", or the verification flag that outranks it.
+
+    The Status column buys about 14 characters, so a flag replaces the
+    tier rather than growing the string: knowing that traffic leaves from
+    somewhere else (or from a network services already distrust) is worth
+    more than the tier, which the detail line still carries.
+    """
+    if n.get("mismatch"):
+        return "Alive · geo≠"          # traffic leaves from another country
+    risk = n.get("risk") or []
+    if "hosting" in risk and "vpn" in risk:
+        return "Alive · DC+VPN"        # datacentre/cloud address
+    if "hosting" in risk:
+        return "Alive · DC"
+    if "vpn" in risk:
+        return "Alive · VPN"
+    return f"Alive · {n.get('strength', 'New')}"
+
+
+def _flags_of(n: dict) -> tuple[str, ...]:
+    """Every verification flag a row carries, for colour and filtering."""
+    flags = []
+    if n.get("mismatch"):
+        flags.append("geo")
+    if "hosting" in (n.get("risk") or []):
+        flags.append("dc")
+    if "vpn" in (n.get("risk") or []):
+        flags.append("vpn")
+    return tuple(flags)
 
 
 def _ago(ts: float) -> str:

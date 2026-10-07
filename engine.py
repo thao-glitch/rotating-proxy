@@ -40,6 +40,7 @@ via a queue).
 
 from __future__ import annotations
 
+import ipaddress
 import random
 import re
 import select
@@ -775,13 +776,127 @@ def _probe_tls(sock: socket.socket, timeout: float) -> bool | None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# exit verification: where traffic really leaves, and who runs that network
+# ---------------------------------------------------------------------------
+# GeoIP answers "where is this address"; it does not answer "does traffic
+# sent to this exit come out there".  Asking an echo service *through* the
+# exit answers that, and the ASN database answers the companion question of
+# what kind of network the address sits on: a row can be geographically
+# right and still be a hosting or VPN address that services already distrust.
+_ECHO_URLS = (
+    "http://icanhazip.com/",
+    "http://checkip.amazonaws.com/",
+    "http://ipecho.net/plain",
+    "http://whatismyip.akamai.com/",
+)
+
+# organisation patterns -> the flag they earn, matched case-insensitively
+# against the ASN database's organisation name.  A provider we have not
+# heard of yet is one line here and nowhere else; nothing matching means
+# "unknown", never "confirmed residential".
+_RISK_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hosting", ("amazon", "aws", "google llc", "google cloud",
+                 "microsoft", "azure", "digitalocean", "linode", "vultr",
+                 "choopa", "hetzner", "ovh", "scaleway", "contabo",
+                 "leaseweb", "worldstream", "psychz", "quadranet",
+                 "hostroyale", "cloudflare", "akamai", "fastly",
+                 "oracle", "alibaba", "tencent", "equinix", "selectel",
+                 "hostinger", "interserver", "datacamp", "ionos",
+                 "persistent llc", "zervers", "time web")),
+    ("vpn", ("vpn", "m247", "town ip", "nordvpn", "expressvpn",
+             "protonvpn", "mullvad", "windscribe", "surfshark",
+             "ipvanish", "cyberghost", "hideipvpn",
+             "private internet access")),
+)
+
+
+def risk_flags(asn_org: str) -> tuple[str, ...]:
+    """Flags for the network an exit sits on: "hosting" / "vpn", or ().
+
+    An empty tuple says "nothing matched", not "this one is clean": the
+    classification is a name check, and an organisation we cannot place
+    must not be claimed to be residential.
+    """
+    if not asn_org:
+        return ()
+    haystack = asn_org.lower()
+    return tuple(flag for flag, needles in _RISK_PATTERNS
+                 if any(needle in haystack for needle in needles))
+
+
+def _split_url(url: str) -> tuple[str, int, str]:
+    """(host, port, path) of an absolute http:// URL."""
+    rest = url.split("://", 1)[1]
+    authority, _, path = rest.partition("/")
+    host, port = _split_hostport(authority, 80)
+    return host, port, "/" + path
+
+
+def _http_via(node: "Node", url: str, timeout: float,
+              limit: int = 256) -> bytes:
+    """GET `url` through `node`: up to `limit` bytes of body, `b""` on trouble.
+
+    Never raises -- verification runs alongside serving traffic, and an
+    exit refusing an echo host is information about that host, not a reason
+    to lose the result of the whole pass.
+    """
+    host, port, path = _split_url(url)
+    sock = None
+    try:
+        if node.proto == "http":
+            sock = socket.create_connection(node.address, timeout=timeout)
+            sock.settimeout(timeout)
+            target = url                        # absolute form for a proxy
+        else:
+            sock = _socks_dial(node.proto, node.address, host, port, timeout)
+            target = path                       # the dial already chose host
+        head_line = f"GET {target} HTTP/1.1\r\nHost: {host}\r\n" \
+                    f"Connection: close\r\n".encode("latin-1")
+        sock.sendall(head_line + _PROBE_UA + b"Accept: */*\r\n\r\n")
+        head, early = _read_header_block(sock, limit=8192)
+        if not _status_line_is_ok(head.split(b"\r\n", 1)[0]):
+            return b""
+        body = early
+        while len(body) < limit:
+            chunk = sock.recv(limit - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return body[:limit]
+    except Exception:
+        return b""
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _parse_ip(body: bytes) -> str:
+    """The first address in an echo reply, "" when there is none.
+
+    Plain text (`1.2.3.4`), one JSON field (`{"ip": "1.2.3.4"}`) and either
+    address family all work, so it does not matter which service answered.
+    """
+    for token in body.decode("latin-1", "replace").replace(",", " ").split():
+        candidate = token.strip("'\"[]{}() \t\r\n")
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return ""
+
+
 class Node:
     """A configured upstream plus its latest observed health."""
 
     __slots__ = ("host", "port", "proto", "cc", "country", "state",
                  "state_code", "city", "status", "latency", "last_check",
                  "last_error", "failures", "hits", "connect_ok",
-                 "score", "samples", "blocks")
+                 "score", "samples", "blocks",
+                 "egress_ip", "verified", "asn", "asn_org", "risk")
 
     def __init__(self, host: str, port: int, proto: str = "http",
                  cc: str = "", country: str = "", state: str = "",
@@ -804,6 +919,12 @@ class Node:
         self.score: float | None = None       # EMA of recent success (0..1)
         self.samples = 0             # observations behind `score`
         self.blocks = 0              # times a target refused this exit's IP
+        # -- exit verification: where traffic really leaves, and who runs it
+        self.egress_ip = ""          # address the internet saw ("" = not proven)
+        self.verified: float = 0.0   # when it was proven (0 = never)
+        self.asn = 0                 # autonomous system number, 0 when unknown
+        self.asn_org = ""            # who runs that network, "" when unknown
+        self.risk: tuple[str, ...] = ()      # "hosting" / "vpn" / … flags
 
     @property
     def label(self) -> str:
@@ -841,6 +962,38 @@ class Node:
     @property
     def https(self) -> str:
         return "yes" if self.connect_ok else ("no" if self.connect_ok is False else "—")
+
+    @property
+    def egress_label(self) -> str:
+        """What the detail line shows for a proven exit, "—" when not proven."""
+        if not self.egress_ip:
+            return "—"
+        name = geodb.lookup(self.egress_ip)[1] or self.egress_ip
+        return f"{self.egress_ip} · {name}"
+
+    @property
+    def egress_cc(self) -> str:
+        """Country of the proven egress address, "" when unknown/unproven."""
+        if not self.egress_ip:
+            return ""
+        return geodb.lookup(self.egress_ip)[0]
+
+    @property
+    def mismatch(self) -> bool:
+        """True when traffic leaves from a different country than we claim.
+
+        Derived, never stored: the declared side of the comparison is
+        GeoIP's answer for the listed address, which a re-import is free to
+        re-resolve -- a cached flag would happily outlive the record it was
+        computed from.
+        """
+        return bool(self.egress_ip and self.cc and self.egress_cc
+                    and self.egress_cc != self.cc)
+
+    @property
+    def risk_label(self) -> str:
+        """"hosting/vpn"-style summary of the network flags, "" when clean."""
+        return "/".join(self.risk)
 
     @property
     def address(self) -> tuple[str, int]:
@@ -884,6 +1037,16 @@ class Node:
             "samples": self.samples,
             "strength": self.strength,
             "blocks": self.blocks,
+            # -- exit verification --
+            "egress_ip": self.egress_ip,
+            "egress_cc": self.egress_cc,
+            "egress_label": self.egress_label,
+            "verified": self.verified,
+            "mismatch": self.mismatch,
+            "asn": self.asn,
+            "asn_org": self.asn_org,
+            "risk": list(self.risk),
+            "risk_label": self.risk_label,
         }
 
 
@@ -946,6 +1109,7 @@ class RotatingProxy:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._checking = threading.Event()
+        self._verifying = threading.Event()    # exit-verification pass
 
         self._nodes: list[Node] = []
         self._cc_hints: dict[str, str] = {}   # label -> country from an import
@@ -1312,6 +1476,11 @@ class RotatingProxy:
                     n.connect_ok = prev.connect_ok
                     n.score, n.samples = prev.score, prev.samples
                     n.blocks = prev.blocks
+                    # verification is expensive to repeat: an address that
+                    # already proved where it leaves keeps the proof (the
+                    # GeoIP record underneath it is re-resolved above)
+                    n.egress_ip, n.verified = prev.egress_ip, prev.verified
+                    n.asn, n.asn_org, n.risk = prev.asn, prev.asn_org, prev.risk
             self._nodes = nodes
         if bad:
             self.log("warn", f"ignored {len(bad)} malformed entr"
@@ -2136,6 +2305,109 @@ class RotatingProxy:
                          name="health", daemon=True).start()
         return True
 
+    # -- exit verification ------------------------------------------------
+    def _fetch_egress(self, node: Node, timeout: float) -> str:
+        """The exit's address as the internet sees it ("" when not proven).
+
+        Spread over a few independent echo services: where the walk starts
+        is a stable function of the label, so the same exit always asks the
+        same service first.  At most two are tried -- an exit that refuses
+        echo hosts must not cost the pass its whole time budget.
+        """
+        if not _ECHO_URLS:
+            return ""
+        start = sum(node.label.encode("utf-8")) % len(_ECHO_URLS)
+        for step in range(min(2, len(_ECHO_URLS))):
+            url = _ECHO_URLS[(start + step) % len(_ECHO_URLS)]
+            ip = _parse_ip(_http_via(node, url, timeout))
+            if ip:
+                return ip
+        return ""
+
+    def verify_node(self, node: Node, *, force: bool = False) -> bool:
+        """Prove where `node` really leaves traffic, and what network it is on.
+
+        Returns True when an egress address is on record.  Echo hosts the
+        exit cannot reach are not a dead exit: they leave the proof empty
+        (keeping an earlier one, if there was one), while the network flags
+        are refreshed either way -- those come from the offline ASN
+        database and cost no round trip.
+        """
+        if force or not node.verified:
+            ip = self._fetch_egress(node, float(self.settings["probe_timeout"]))
+            if ip:
+                node.egress_ip = ip
+                node.verified = time.time()
+        number, org = geodb.asn_info(node.egress_ip or node.host)
+        node.asn, node.asn_org = number, org
+        node.risk = risk_flags(org)
+        return bool(node.verified)
+
+    def verify_now(self, *, force: bool = False) -> bool:
+        """Run exit verification in the background; False if one is running.
+
+        The flag is claimed *before* the thread exists, so a waiter
+        polling `snapshot()["verifying"]` can never miss a fast pass.
+        """
+        if self._verifying.is_set():
+            self.log("info", "an exit verification is already running")
+            return False
+        self._verifying.set()
+        threading.Thread(target=self._run_verify, args=(force,),
+                         kwargs={"owned": True},
+                         name="verify", daemon=True).start()
+        return True
+
+    def _run_verify(self, force: bool = False, *, owned: bool = False) -> None:
+        """Ask every exit that is not dead where it really leaves traffic.
+
+        `owned=True` means `verify_now()` already claimed the flag; a
+        direct call claims it here and gives up if a pass is in flight.
+        """
+        if not owned:
+            if self._verifying.is_set():
+                self.log("info", "an exit verification is already running")
+                return
+            self._verifying.set()
+        t0 = time.monotonic()
+        try:
+            with self._lock:
+                # not "alive": a command-line run has never been swept, and
+                # asking an unknown exit is exactly the point.  Dead ones
+                # are skipped -- they already failed to carry traffic.
+                targets = [n for n in self._nodes if n.status != "dead"]
+            if not force:
+                targets = [n for n in targets if not n.verified]
+            if not targets:
+                self.log("info", "verification: nothing to ask — every exit "
+                                 "is either dead or already proved where "
+                                 "it leaves")
+                return
+            count = len(targets)
+            self.log("info", f"verifying {count} "
+                             f"exit{'' if count == 1 else 's'} "
+                             "(asking where traffic really leaves)…")
+            workers = min(16, max(2, (len(targets) + 7) // 8))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(lambda n: self.verify_node(n, force=force),
+                              targets))
+            with self._lock:
+                proven = sum(1 for n in self._nodes if n.verified)
+                mismatched = sum(1 for n in self._nodes if n.mismatch)
+                risky = sum(1 for n in self._nodes if n.risk)
+            self.log("info",
+                     f"exit verification done in {time.monotonic() - t0:.1f}s — "
+                     f"{len(targets)} checked, {proven} proved where they "
+                     f"leave, "
+                     f"{mismatched} {'leaves' if mismatched == 1 else 'leave'}"
+                     " from another country, "
+                     f"{risky} {'sits' if risky == 1 else 'sit'} on "
+                     "hosting/VPN networks")
+        except Exception as exc:                # never lose the pass silently
+            self.log("error", f"verification failed: {str(exc)[:120]}")
+        finally:
+            self._verifying.clear()
+
     def _run_sweep(self, reason: str) -> None:
         if self._checking.is_set():
             return
@@ -2505,9 +2777,13 @@ class RotatingProxy:
                 pool_socks=sum(1 for n in self._nodes if n.proto != "http"),
                 pool_strong=sum(1 for n in self._nodes
                                 if n.strength == "Strong"),
+                verified=sum(1 for n in self._nodes if n.verified),
+                mismatch=sum(1 for n in self._nodes if n.mismatch),
+                risk=sum(1 for n in self._nodes if n.risk),
                 host=self.host,
                 port=self.port,
                 checking=self._checking.is_set(),
+                verifying=self._verifying.is_set(),
                 progress=self.stats["check_progress"],
                 uptime=(time.time() - self.stats["started_at"]
                         if self.stats["started_at"] and self.running else 0),

@@ -348,6 +348,48 @@ def start_connect_proxy(mode: str = "tls") -> int:
     return port
 
 
+def start_echo(ip: str) -> tuple[int, list]:
+    """An echo service: replies with `ip` and counts the asks.
+
+    The one host a verification pass needs from the far side -- the answer
+    that comes back is the exit's own address as the internet sees it,
+    which is the whole proof.
+    """
+    hits: list = []
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(50)
+    port = srv.getsockname()[1]
+
+    def session(conn):
+        try:
+            conn.recv(4096)
+            body = f"{ip}\n".encode()
+            hits.append(1)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: "
+                         + str(len(body)).encode()
+                         + b"\r\nConnection: close\r\n\r\n" + body)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def loop():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=session, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return port, hits
+
+
 # ---------------------------------------------------------------------------
 # mock SOCKS4 / SOCKS5 upstreams
 # ---------------------------------------------------------------------------
@@ -921,6 +963,128 @@ def test_tls_probe():
           mitm.label not in labels, str(labels))
     check("inconclusive exit stays in play",
           closed.label in labels, str(labels))
+
+
+def test_exit_verification():
+    """Where traffic really leaves: the proof, the mismatch, the flags.
+
+    GeoIP says where the *listed* address is; only asking an echo host
+    through the exit says where traffic really comes out.  Four things
+    have to hold: the proof lands on the row, a country disagreement is
+    flagged rather than smoothed over, the network flags come from the
+    offline ASN database (echo or no echo), and an exit that refuses to
+    answer is left unproven instead of being called dead.
+    """
+    print("\nexit verification (egress proof + risk flags)")
+    import engine
+    import geodb
+
+    echo_port, hits = start_echo("198.51.100.7")
+    mock = start_mock(alive=True)             # reaches the echo host
+    refuses_port = start_mock(alive=False)    # answers 502 to everything
+    nowhere = _free_port()                    # nothing listens here
+
+    real_urls, real_lookup, real_asn = (engine._ECHO_URLS,
+                                        geodb.lookup, geodb.asn_info)
+    engine._ECHO_URLS = (f"http://127.0.0.1:{echo_port}/",)
+
+    def lookup(host: str):
+        # the listed address claims Germany, the egress lands in the US
+        if host == "198.51.100.7":
+            return ("US", "United States")
+        if host.startswith("127.0.0.1"):
+            return ("DE", "Germany")
+        return ("", "")
+
+    def asn(host: str):
+        if host == "198.51.100.7":
+            return (16509, "Amazon.com, Inc.")
+        if host.startswith("127.0.0.1"):
+            return (9009, "M247 Ltd")         # a VPN provider by name
+        return (0, "")
+
+    geodb.lookup, geodb.asn_info = lookup, asn
+    try:
+        eng = RotatingProxy(logger=quiet, probe_timeout=4.0,
+                            proxies=[f"127.0.0.1:{mock}",
+                                     f"127.0.0.1:{refuses_port}",
+                                     f"127.0.0.1:{nowhere}"])
+        works, refuses, dead = eng._nodes
+        dead.status = "dead"
+        check("nothing is proved before the pass",
+              not any(n.verified for n in eng._nodes),
+              str([(n.label, n.verified) for n in eng._nodes]))
+
+        eng._run_verify()
+        check("egress address recorded", works.egress_ip == "198.51.100.7",
+              f"{works.egress_ip} ({len(hits)} asks)")
+        check("proof is timestamped", works.verified > 0,
+              str(works.verified))
+        check("detail line names the egress country",
+              "United States" in works.egress_label, works.egress_label)
+        check("country disagreement flagged",
+              works.mismatch is True and works.cc == "DE"
+              and works.egress_cc == "US",
+              f"cc={works.cc} egress={works.egress_cc} {works.mismatch}")
+        check("network flags come from the egress address",
+              works.asn == 16509 and works.risk == ("hosting",),
+              f"AS{works.asn} {works.risk}")
+        check("dead exits are never asked", dead.verified == 0
+              and dead.asn == 0, f"{dead.verified} {dead.asn}")
+        snap = eng.snapshot()
+        check("snapshot counts the pass",
+              snap["verified"] == 1 and snap["mismatch"] == 1
+              and snap["risk"] == 2,
+              str({k: snap[k] for k in ("verified", "mismatch", "risk")}))
+        row = works.as_dict()
+        check("row carries it for the panel",
+              row["egress_ip"] == "198.51.100.7"
+              and row["risk_label"] == "hosting",
+              str({k: row[k] for k in ("egress_ip", "risk_label")}))
+
+        # a proof on record is not paid for twice ...
+        asked = len(hits)
+        eng._run_verify()
+        check("proved exits are not asked again", len(hits) == asked,
+              f"{asked} -> {len(hits)}")
+
+        # ... an exit that refuses the echo keeps no proof, is not called
+        # dead, and still gets the flags its own address earns
+        check("an exit that refuses the echo stays unproven",
+              refuses.verified == 0 and refuses.status != "dead",
+              f"{refuses.verified} {refuses.status}")
+        check("offline flags apply without an echo",
+              refuses.asn == 9009 and refuses.risk == ("vpn",),
+              f"AS{refuses.asn} {refuses.risk}")
+
+        # a pool reload re-resolves GeoIP but must not throw the proof away
+        eng.set_proxies([f"127.0.0.1:{mock}", f"127.0.0.1:{refuses_port}"])
+        again = {n.label: n for n in eng._nodes}[f"127.0.0.1:{mock}"]
+        check("proof survives a pool reload",
+              again.verified == works.verified
+              and again.egress_ip == "198.51.100.7",
+              f"{again.verified} {again.egress_ip}")
+        again.cc = "US"                        # GeoIP agrees this time
+        check("a matching country is not flagged", again.mismatch is False,
+              str(again.mismatch))
+
+        # the background entry point the panel's menu calls
+        asked = len(hits)
+        check("pass starts in the background",
+              eng.verify_now(force=True) is True)
+        deadline = time.time() + 20
+        while len(hits) <= asked and time.time() < deadline:
+            time.sleep(0.05)
+        while eng.snapshot()["verifying"] and time.time() < deadline:
+            time.sleep(0.05)
+        check("it really asked again", len(hits) > asked,
+              f"{asked} -> {len(hits)}")
+        check("background pass left the proof in place",
+              again.verified > 0 and not eng.snapshot()["verifying"],
+              f"{again.verified} {eng.snapshot()['verifying']}")
+    finally:
+        engine._ECHO_URLS = real_urls
+        geodb.lookup, geodb.asn_info = real_lookup, real_asn
 
 
 def test_stats_and_list_ops():
@@ -1953,6 +2117,7 @@ def main():
         lambda: test_socks_connect(target_port, socks4_port, socks5_port),
         lambda: test_socks_health(socks4_port, socks5_port, dead_port),
         test_tls_probe,
+        test_exit_verification,
         test_stats_and_list_ops,
         test_country,
         test_region_state,

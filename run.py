@@ -14,6 +14,8 @@ Rotating Proxy — entry point.
     python3 run.py --https-only    only use upstreams that tunnel HTTPS
     python3 run.py --geo-fetch     download the state/city database once
     python3 run.py --geo-status    what geo data is installed right now
+    python3 run.py --asn-fetch     download the network (ASN) database once
+    python3 run.py --verify        ask each exit where traffic really leaves
 
 Point any HTTP/HTTPS client (browser, curl, scraper, …) at the address the
 panel shows -- by default http://127.0.0.1:8888.
@@ -102,6 +104,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "lookup is offline from then on")
     p.add_argument("--geo-status", action="store_true",
                    help="print which geo databases are installed and exit")
+    p.add_argument("--asn-fetch", action="store_true",
+                   help="download the ASN database once (about 5 MB, DB-IP "
+                        "ASN Lite, CC BY 4.0) and exit; exit risk flags "
+                        "(hosting/VPN) are offline from then on")
+    p.add_argument("--verify", action="store_true",
+                   help="ask every exit in scope where its traffic really "
+                        "leaves, flag the ones whose egress address "
+                        "disagrees with their own record and the ones on "
+                        "hosting/VPN networks, then exit")
+    p.add_argument("--force", action="store_true",
+                   help="with --verify: ask again even where an answer is "
+                        "already on record")
     p.add_argument("--use", metavar="FLAGS",
                    default=DEFAULTS["use_only"],
                    help=f"comma-separated routing scope: "
@@ -139,6 +153,17 @@ def run_geo_status() -> int:
         print("\nget it once with `python3 run.py --geo-fetch` "
               "(or the panel's Settings dialog);\nlookups are offline "
               "from then on.")
+    asn = geodb.asn_status()
+    if asn["available"]:
+        when = time.strftime("%Y-%m-%d", time.localtime(asn["updated"])) \
+            if asn.get("updated") else "unknown date"
+        print(f"{'network':8} ok       {asn['path']} "
+              f"({_human(asn['size'])}, {when})")
+        print("\nexit risk flags (hosting/VPN, `--verify`) work.")
+    else:
+        print(f"{'network':8} missing  -- exit risk flags are empty")
+        print("\nget it once with `python3 run.py --asn-fetch`; "
+              "egress checks in\n`--verify` work either way.")
     return 0
 
 
@@ -166,6 +191,173 @@ def run_geo_fetch() -> int:
     print(f"installed {path} ({_human(path.stat().st_size)})")
     print("state selection is ready -- try `python3 run.py --check "
           "--state California`")
+    return 0
+
+
+def run_asn_fetch() -> int:
+    """Download the ASN database once (who runs an exit's network)."""
+    import geodb
+
+    info = geodb.asn_status()
+    if info["available"]:
+        print(f"already installed: {info['path']} "
+              f"({_human(info['size'])}) -- fetching a fresh copy")
+
+    def progress(done: int, total: int) -> None:
+        pct = f" ({100 * done // total}%)" if total else ""
+        print(f"\r  {_human(done)}"
+              + (f" / {_human(total)}" if total else "") + pct,
+              end="", flush=True)
+
+    try:
+        path = geodb.fetch_asn_db(progress=progress)
+    except Exception as exc:                       # noqa: BLE001
+        print(f"\nerror: {exc}", file=sys.stderr)
+        return 1
+    print()
+    print(f"installed {path} ({_human(path.stat().st_size)})")
+    print("exit risk flags are ready -- try `python3 run.py --verify`")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --verify: where traffic really leaves, and who runs that network
+# ---------------------------------------------------------------------------
+def _load_pool(args) -> tuple[dict, list]:
+    """Settings and proxy labels to verify: the saved pool, CLI override.
+
+    The panel's `proxy_state.json` is what the user actually routes
+    through, so verification reads it instead of starting from the
+    bundled demo list; `--proxy` still wins when given explicitly.
+    """
+    import json
+
+    from appstate import state_file
+
+    settings, labels = dict(DEFAULTS), list(PROXY_LIST)
+    path = state_file()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"warning: could not read {path.name}: {exc}",
+                  file=sys.stderr)
+            data = None
+        if isinstance(data, dict):
+            saved = data.get("proxies")
+            if isinstance(saved, list) and saved:
+                labels = [str(p) for p in saved]
+            for key, value in (data.get("settings") or {}).items():
+                if key in settings and not isinstance(settings[key],
+                                                       (list, dict)):
+                    settings[key] = value
+    if args.proxy:
+        labels = list(args.proxy)
+        # an explicit list means "just these": keeping the saved exit
+        # scope would silently drop most of what was asked for
+        for key in ("region", "country", "state"):
+            settings[key] = ""
+    return settings, labels
+
+
+def run_verify(args) -> int:
+    """One verification pass over the pool, then a report; then exit."""
+    settings, labels = _load_pool(args)
+
+    def log(level: str, message: str) -> None:
+        # the engine talks through this on stderr-ish terms: without it a
+        # long pass would sit in silence with no idea how far along it is
+        if level in ("info", "warn", "error"):
+            print(f"[{time.strftime('%H:%M:%S')}] [{level.upper():5}] "
+                  f"{message}")
+
+    engine = RotatingProxy(proxies=labels, logger=log,
+                           probe_timeout=float(settings["probe_timeout"]))
+    # the same cascade --check uses: every choice validated against the
+    # full pool first, then everything outside it set aside.  With no
+    # flags given the *saved* scope is used, so what gets verified is the
+    # exit the panel is actually routing through.
+    for flag, apply, cli, key in (("--region", engine.set_region,
+                                   args.region, "region"),
+                                  ("--country", engine.set_country,
+                                   args.country, "country"),
+                                  ("--state", engine.set_state,
+                                   args.state, "state")):
+        value = cli or settings.get(key)
+        if not value:
+            continue
+        try:
+            apply(value)
+        except ValueError as exc:
+            print(f"error: {flag}: {exc}", file=sys.stderr)
+            return 1
+    if engine.region or engine.country or engine.state:
+        keep = _in_exit_scope(engine)
+        engine.set_proxies([n["label"] for n in engine.nodes() if keep(n)])
+        if not engine.proxies():
+            print(f"error: no upstream in {engine.exit_place}",
+                  file=sys.stderr)
+            return 1
+        count = len(engine.proxies())
+        print(f"Exit: {engine.exit_place} — {count} upstream"
+              f"{'' if count == 1 else 's'} will be verified")
+
+    import geodb
+    if not geodb.asn_available():
+        print(f"note: {geodb.asn_source()} — risk flags (hosting/VPN) stay "
+              "empty until\n      `python3 run.py --asn-fetch` has been run; "
+              "egress checks still work.")
+
+    total = len(engine.proxies())
+    print(f"Verifying {total} exit{'' if total == 1 else 's'} "
+          f"(asking where traffic really leaves)…")
+    if not engine.verify_now(force=bool(args.force)):
+        print("error: a verification pass is already running",
+              file=sys.stderr)
+        return 1
+    while engine.snapshot().get("verifying"):
+        time.sleep(0.2)
+
+    rows = engine.nodes()
+    proven = [r for r in rows if r["verified"]]
+    unproven = [r for r in rows if not r["verified"]]
+    mismatch = [r for r in rows if r["mismatch"]]
+    risky = [r for r in rows if r["risk"]]
+
+    def plural(count: int, one: str, many: str) -> str:
+        return one if count == 1 else many
+
+    print(f"\n{len(proven)} of {len(rows)} proved where they leave "
+          f"({len(unproven)} could not be asked)")
+    if risky:
+        hosting = sum(1 for r in risky if "hosting" in r["risk"])
+        vpn = sum(1 for r in risky if "vpn" in r["risk"])
+        print(f"{len(risky)} {plural(len(risky), 'sits', 'sit')} on networks "
+              f"services already distrust ({hosting} hosting/datacenter, "
+              f"{vpn} VPN)")
+    if mismatch:
+        print(f"\n{len(mismatch)} "
+              f"{plural(len(mismatch), 'leaves', 'leave')} from a different "
+              "country than they claim:")
+        for row in sorted(mismatch, key=lambda r: r["label"])[:20]:
+            print(f"  {row['label']:42} claims "
+                  f"{row['country_label']:18} leaves from "
+                  f"{row['egress_label']}")
+        if len(mismatch) > 20:
+            print(f"  … and {len(mismatch) - 20} more")
+    if risky:
+        print("\nRisky networks (flagged from the ASN database):")
+        for row in sorted(risky, key=lambda r: r["label"])[:20]:
+            print(f"  {row['label']:42} {row['risk_label']:14} "
+                  f"AS{row['asn']} {row['asn_org']}")
+        if len(risky) > 20:
+            print(f"  … and {len(risky) - 20} more")
+    if not proven:
+        print("\nnothing could be proved: no exit answered the echo hosts "
+              "(are they even reachable?)")
+    elif not mismatch and not risky:
+        print("\nno exit disagrees with its record, "
+              "and none sits on a flagged network.")
     return 0
 
 
@@ -454,6 +646,10 @@ def main(argv=None) -> int:
         return run_geo_status()
     if args.geo_fetch:
         return run_geo_fetch()
+    if args.asn_fetch:
+        return run_asn_fetch()
+    if args.verify:
+        return run_verify(args)
     if args.check:
         return run_check(args)
     if args.cli:
