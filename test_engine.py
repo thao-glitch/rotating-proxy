@@ -10,6 +10,7 @@ health checker can all be verified without touching the real internet.
 """
 
 import socket
+import ssl
 import threading
 import time
 import traceback
@@ -34,6 +35,14 @@ def _dial_upstream(host: str, port: int, timeout: float = 5) -> socket.socket:
     if host == "example.com" and _TARGET_PORT:
         host, port = "127.0.0.1", _TARGET_PORT
     return socket.create_connection((host, port), timeout=timeout)
+
+
+def _dial_exit(host: str, port: int, tls_port: int | None = None) -> socket.socket:
+    """Where a SOCKS exit lands: the local TLS server for :443 when the test
+    asked for one (so the tunnel probe never needs the real internet)."""
+    if tls_port and port == 443:
+        return socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+    return _dial_upstream(host, port)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +197,158 @@ def start_mock(alive: bool = True, *, reject_status: str | None = None,
 
 
 # ---------------------------------------------------------------------------
+# TLS-transparency fixtures: a CA of our own, a server wearing its
+# certificate, and a CONNECT upstream that terminates TLS itself -- the
+# shape of an exit that reads the traffic instead of forwarding it.
+# ---------------------------------------------------------------------------
+TEST_CA_PEM = """-----BEGIN CERTIFICATE-----
+MIIBqTCCAVCgAwIBAgIUE6wt1V2mgfhTj8LdF2WyC9HhA8cwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWUm90YXRpbmcgUHJveHkgVGVzdCBDQTAeFw0yNjEwMDcxNDI3
+MzFaFw0zNjEwMDQxNDI3MzFaMCExHzAdBgNVBAMMFlJvdGF0aW5nIFByb3h5IFRl
+c3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARzM3OYaSQ2yQyo/uWmeTK8
+iXLo/1E3mqoarW+p1U522XENpEUPfkxY2JwslipQjXg3olamadiK2pQXxfi+yjRO
+o2YwZDAfBgNVHSMEGDAWgBR3r45iLGSOCB8IynkPqoBa1Q7/ezASBgNVHRMBAf8E
+CDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUd6+OYixkjggfCMp5
+D6qAWtUO/3swCgYIKoZIzj0EAwIDRwAwRAIgEBVj4pK20OOb9gfz+MDF3REhokI0
++G3DdJE5rxN/d1cCIGUT43U0p+a+mfTLp3QFJ5tv8nLSpls81UmoVu//5xJh
+-----END CERTIFICATE-----
+"""
+TEST_CERT_PEM = """-----BEGIN CERTIFICATE-----
+MIIB2TCCAX+gAwIBAgIUM3/tw4G50vpSwFriLfP06xlmjEowCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWUm90YXRpbmcgUHJveHkgVGVzdCBDQTAeFw0yNjEwMDcxNDI3
+MzFaFw0zNjEwMDQxNDI3MzFaMBYxFDASBgNVBAMMC2V4YW1wbGUuY29tMFkwEwYH
+KoZIzj0CAQYIKoZIzj0DAQcDQgAEiuRXNapLVdzkY6hSmzCaW9mx3zlya0CGoAmC
+kruJa9Xu6O9bYxkEMc4hCf2Xoc4rVApIfs2QDcW6HULAsbYZSqOBnzCBnDAMBgNV
+HRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAn
+BgNVHREEIDAeggtleGFtcGxlLmNvbYIJbG9jYWxob3N0hwR/AAABMB0GA1UdDgQW
+BBQN4pyCL7ojtdl/m7pcJQT0sjv+tDAfBgNVHSMEGDAWgBR3r45iLGSOCB8IynkP
+qoBa1Q7/ezAKBggqhkjOPQQDAgNIADBFAiEAqmGotfcv+iC7AelAOsNgzc1MXlqW
+2d+xD6Ixa/cAYS4CIDPsz0YQ2mSMfuqlBue1u/1M5MLDD8vhFR9eX1QOFDoE
+-----END CERTIFICATE-----
+"""
+TEST_KEY_PEM = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgfuze11X++H3TFxcu
+FMzRDTWfDSN5KaRo6XaJiM/5lcmhRANCAASK5Fc1qktV3ORjqFKbMJpb2bHfOXJr
+QIagCYKSu4lr1e7o71tjGQQxziEJ/ZehzitUCkh+zZANxbodQsCxthlK
+-----END PRIVATE KEY-----
+"""
+_TLS_FILES: tuple[str, str] | None = None
+
+
+def _tls_cert_files() -> tuple[str, str]:
+    """Write the embedded PEMs to disk -- `load_cert_chain` only takes paths."""
+    global _TLS_FILES
+    if _TLS_FILES is None:
+        import tempfile
+        from pathlib import Path
+        folder = Path(tempfile.mkdtemp(prefix="rotproxy-tls-"))
+        cert, key = folder / "server.pem", folder / "server.key"
+        cert.write_text(TEST_CERT_PEM, encoding="utf-8")
+        key.write_text(TEST_KEY_PEM, encoding="utf-8")
+        _TLS_FILES = (str(cert), str(key))
+    return _TLS_FILES
+
+
+def probe_context(trust: bool):
+    """The probe's client context: the system store, or our own CA added."""
+    ctx = ssl.create_default_context()
+    if trust:
+        ctx.load_verify_locations(cadata=TEST_CA_PEM)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def _tls_server_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cert, key = _tls_cert_files()
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
+def start_tls_server() -> int:
+    """TLS server wearing the test CA's certificate: a tunnel's far end."""
+    ctx = _tls_server_context()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(50)
+    port = srv.getsockname()[1]
+
+    def serve(conn):
+        try:
+            with ctx.wrap_socket(conn, server_side=True):
+                pass                      # the handshake is all we owe them
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def loop():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return port
+
+
+def start_connect_proxy(mode: str = "tls") -> int:
+    """Fake HTTP upstream: CONNECT always gets a 200, then `mode` decides.
+
+    "tls"    -- terminate TLS with our own certificate: an exit that reads
+                the traffic instead of forwarding it (an interceptor);
+    "close"  -- hang up the moment the tunnel is open: inconclusive;
+    "refuse" -- answer 407, the classic "won't tunnel for us".
+    """
+    server_ctx = _tls_server_context() if mode == "tls" else None
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(50)
+    port = srv.getsockname()[1]
+
+    def session(conn):
+        try:
+            head = _read_head(conn)
+            if not head:
+                return
+            if mode == "refuse":
+                conn.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                             b"Content-Length: 0\r\n\r\n")
+                return
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            if mode == "close":
+                return                     # opened, then gone: no evidence
+            with server_ctx.wrap_socket(conn, server_side=True):
+                pass
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def loop():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=session, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return port
+
+
+# ---------------------------------------------------------------------------
 # mock SOCKS4 / SOCKS5 upstreams
 # ---------------------------------------------------------------------------
 def _read_exact(sock, n: int) -> bytes:
@@ -209,8 +370,12 @@ def _read_cstring(sock) -> bytes:
         out += b
 
 
-def socks_session(sock, version: int) -> None:
-    """Speak SOCKS4/SOCKS4a or SOCKS5, then relay to the requested target."""
+def socks_session(sock, version: int, tls_port: int | None = None) -> None:
+    """Speak SOCKS4/SOCKS4a or SOCKS5, then relay to the requested target.
+
+    `tls_port` sends `example.com:443` (only) to a local TLS server, so the
+    tunnel probe can be exercised without reaching the real internet.
+    """
     up = None
     try:
         if version == 4:
@@ -221,7 +386,7 @@ def socks_session(sock, version: int) -> None:
             host = socket.inet_ntoa(ip)
             if ip[:3] == b"\x00\x00\x00" and ip[3] != 0:          # SOCKS4a
                 host = _read_cstring(sock).decode()
-            up = _dial_upstream(host, port)
+            up = _dial_exit(host, port, tls_port)
             sock.sendall(b"\x00\x5a" + hdr[2:8])                  # granted
         else:
             ver, n = _read_exact(sock, 2)
@@ -237,7 +402,7 @@ def socks_session(sock, version: int) -> None:
                 _read_exact(sock, 16)
                 host = "::1"
             port = int.from_bytes(_read_exact(sock, 2), "big")
-            up = _dial_upstream(host, port)
+            up = _dial_exit(host, port, tls_port)
             sock.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)       # succeeded
         _pump(sock, up)
     except OSError:
@@ -254,7 +419,7 @@ def socks_session(sock, version: int) -> None:
             pass
 
 
-def start_socks(version: int) -> int:
+def start_socks(version: int, tls_port: int | None = None) -> int:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -267,7 +432,7 @@ def start_socks(version: int) -> int:
                 c, _ = srv.accept()
             except OSError:
                 return
-            threading.Thread(target=socks_session, args=(c, version),
+            threading.Thread(target=socks_session, args=(c, version, tls_port),
                              daemon=True).start()
 
     threading.Thread(target=loop, daemon=True).start()
@@ -665,10 +830,17 @@ def test_socks_health(socks4_port, socks5_port, dead_port):
                         probe_timeout=4.0)   # the engine's default; the
                                              # 2.0 this test used to use
                                              # flakes on a loaded desktop
-    eng.check_now(reason="test")
-    deadline = time.time() + 20
-    while eng.checking and time.time() < deadline:
-        time.sleep(0.05)
+    # the tunnel probe now handshakes: trust our own CA so this sweep is
+    # about reachability (the untrusted case is test_tls_probe's job)
+    import engine
+    saved_ctx, engine._TLS_CTX = engine._TLS_CTX, probe_context(trust=True)
+    try:
+        eng.check_now(reason="test")
+        deadline = time.time() + 20
+        while eng.checking and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        engine._TLS_CTX = saved_ctx
     nodes = {n["label"]: n for n in eng.nodes()}
     check("socks4 marked alive", nodes.get(s4, {}).get("status") == "alive",
           str(nodes.get(s4)))
@@ -676,11 +848,79 @@ def test_socks_health(socks4_port, socks5_port, dead_port):
           str(nodes.get(s5)))
     check("dead socks marked dead", nodes.get(dead, {}).get("status") == "dead",
           str(nodes.get(dead)))
-    check("https reachability recorded",
+    check("tunnel opened with a certificate that verified",
           nodes.get(s4, {}).get("connect_ok") is True,
           str(nodes.get(s4, {}).get("connect_ok")))
     check("snapshot counts socks pool",
           eng.snapshot()["pool_socks"] == 3, str(eng.snapshot()["pool_socks"]))
+
+
+def test_tls_probe():
+    """CONNECT 2xx only opens a pipe: the certificate decides the verdict.
+
+    Three exits, all willing to tunnel -- one terminates TLS itself, one
+    hangs up the moment the tunnel is open, one refuses outright -- plus a
+    SOCKS exit behind a TLS server.  The interceptor must be condemned
+    (that is what `https_only` then excludes), the hang-up must stay in
+    play, and trusting the CA has to flip the verdict the other way.
+    """
+    print("\nTLS transparency probe")
+    import engine
+
+    mitm_port = start_connect_proxy("tls")
+    close_port = start_connect_proxy("close")
+    refuse_port = start_connect_proxy("refuse")
+    socks_port = start_socks(5, tls_port=start_tls_server())
+
+    eng = RotatingProxy(logger=quiet, probe_timeout=4.0,
+                        proxies=[f"127.0.0.1:{mitm_port}",
+                                 f"127.0.0.1:{close_port}",
+                                 f"127.0.0.1:{refuse_port}",
+                                 f"socks5://127.0.0.1:{socks_port}"])
+    by_port = {n.port: n for n in eng._nodes}
+    mitm, closed, refused = (by_port[mitm_port], by_port[close_port],
+                             by_port[refuse_port])
+    socks = next(n for n in eng._nodes if n.proto == "socks5")
+    for n in eng._nodes:
+        n.status = "alive"
+
+    # -- the system trust store: only a transparent exit passes ------------
+    check("intercepting exit condemned",
+          eng._probe_connect(mitm, 4.0) is False,
+          str(eng._probe_connect(mitm, 4.0)))
+    check("hang-up mid-handshake is inconclusive",
+          eng._probe_connect(closed, 4.0) is None,
+          str(eng._probe_connect(closed, 4.0)))
+    check("407 still means no tunnel",
+          eng._probe_connect(refused, 4.0) is False,
+          str(eng._probe_connect(refused, 4.0)))
+    check("SOCKS exit serving its own certificate condemned",
+          eng._probe_socks_tunnel(socks, 4.0) is False,
+          str(eng._probe_socks_tunnel(socks, 4.0)))
+
+    # -- the same exits, with a context that trusts the test CA ------------
+    saved_ctx, engine._TLS_CTX = engine._TLS_CTX, probe_context(trust=True)
+    try:
+        check("trusted CA: interceptor reads as transparent",
+              eng._probe_connect(mitm, 4.0) is True,
+              str(eng._probe_connect(mitm, 4.0)))
+        check("trusted CA: SOCKS tunnel reads as transparent",
+              eng._probe_socks_tunnel(socks, 4.0) is True,
+              str(eng._probe_socks_tunnel(socks, 4.0)))
+    finally:
+        engine._TLS_CTX = saved_ctx
+
+    # -- what the sweep records, and what https_only does with it ----------
+    alive, _lat, _err, connect = eng.probe(mitm)
+    check("sweep records the interceptor as unable to tunnel",
+          alive and connect is False, f"{alive=} {connect=}")
+    mitm.connect_ok = connect           # what the sweep would have stored
+    eng.set_https_only(True)
+    labels = [n.label for n in eng._candidates(connect=True)]
+    check("https_only excludes the interceptor",
+          mitm.label not in labels, str(labels))
+    check("inconclusive exit stays in play",
+          closed.label in labels, str(labels))
 
 
 def test_stats_and_list_ops():
@@ -1691,8 +1931,9 @@ def main():
     mock_port = start_mock(alive=True)
     reject_port = start_mock(reject_status="407")
     early_port = start_mock(early=b"EARLY-DATA")
-    socks4_port = start_socks(4)
-    socks5_port = start_socks(5)
+    tls_target = start_tls_server()          # what example.com:443 becomes
+    socks4_port = start_socks(4, tls_port=tls_target)
+    socks5_port = start_socks(5, tls_port=tls_target)
     dead_port = _free_port()                 # nothing listening
 
     tests = [
@@ -1711,6 +1952,7 @@ def main():
         lambda: test_socks5_relay(target_port, socks5_port),
         lambda: test_socks_connect(target_port, socks4_port, socks5_port),
         lambda: test_socks_health(socks4_port, socks5_port, dead_port),
+        test_tls_probe,
         test_stats_and_list_ops,
         test_country,
         test_region_state,

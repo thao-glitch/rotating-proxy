@@ -44,6 +44,7 @@ import random
 import re
 import select
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -678,6 +679,102 @@ _PROBE_UA = (b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
              b"Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n")
 
 
+# ---------------------------------------------------------------------------
+# TLS transparency probe
+# ---------------------------------------------------------------------------
+# An exit that answers CONNECT 2xx has only proven it will open a byte pipe:
+# plenty of free proxies terminate TLS themselves with a certificate they
+# minted on the spot, which is exactly the "self-signed certificate in
+# certificate chain" a browser reports as no internet.  Handshaking through
+# the open tunnel with certificate verification is the one way to tell a
+# transparent exit from one that is reading the traffic.
+_TLS_PROBE_HOST = "example.com"    # tunnel target, SNI and name being verified
+_TLS_CTX: ssl.SSLContext | None = None
+
+
+def _tls_context() -> ssl.SSLContext:
+    """The certificate-verified context the probe handshakes with.
+
+    Built once and shared: `create_default_context()` reads the system trust
+    store, which needs no network and no configuration.  The probe asks the
+    exit for `_TLS_PROBE_HOST`'s real certificate, so only a genuinely
+    transparent tunnel passes -- anything signed by a CA the machine does not
+    trust (an intercepting proxy's, for instance) fails verification.
+    Tests swap `_TLS_CTX` for a context trusting their own CA.
+    """
+    global _TLS_CTX
+    if _TLS_CTX is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        _TLS_CTX = ctx
+    return _TLS_CTX
+
+
+def _probe_tls(sock: socket.socket, timeout: float) -> bool | None:
+    """Handshake through an already-open tunnel: is it certificate-clean?
+
+    Returns
+
+    * ``True`` -- the exit served the real certificate, so it only forwards
+      bytes and the client's own verification will pass;
+    * ``False`` -- verification failed: somebody in the middle is issuing
+      its own certificate for the target, so this exit is a MITM (excluded
+      by the hard ``https_only`` scope);
+    * ``None`` -- reset, EOF or timeout mid-handshake: no proof either way,
+      so the exit stays in play.
+
+    The handshake runs over `MemoryBIO`s rather than `wrap_socket`, which
+    would take the descriptor over and close it on failure: here the socket
+    still belongs to the caller, whose `close()` must happen exactly once
+    no matter which way the probe came out.
+    """
+    try:
+        sock.settimeout(timeout)
+    except OSError:
+        return None
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    try:
+        tls = _tls_context().wrap_bio(incoming, outgoing,
+                                      server_hostname=_TLS_PROBE_HOST)
+    except Exception:
+        return None                        # context unusable: inconclusive
+    deadline = time.monotonic() + max(float(timeout), 0.1)
+    try:
+        while True:
+            try:
+                tls.do_handshake()
+                return True                # certificate verified
+            except ssl.SSLCertVerificationError:
+                return False               # MITM: the cert is not the real one
+            except ssl.SSLWantReadError:
+                pass                       # normal: needs more of the record
+            except Exception:
+                return None                # protocol noise, wrong ALPN, ...
+            pending = outgoing.read()      # ClientHello (and more) to forward
+            if pending:
+                try:
+                    sock.sendall(pending)
+                except OSError:
+                    return None
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                sock.settimeout(left)
+                chunk = sock.recv(8192)
+            except (OSError, ValueError):
+                return None                # reset or timed out mid-handshake
+            if not chunk:
+                return None                # peer hung up on us
+            incoming.write(chunk)
+    finally:
+        try:
+            tls.close()
+        except Exception:
+            pass
+
+
 class Node:
     """A configured upstream plus its latest observed health."""
 
@@ -703,7 +800,7 @@ class Node:
         self.last_error = ""
         self.failures = 0            # consecutive failures
         self.hits = 0                # connections successfully served
-        self.connect_ok: bool | None = None   # HTTPS tunnel support
+        self.connect_ok: bool | None = None   # HTTPS tunnel + cert intact
         self.score: float | None = None       # EMA of recent success (0..1)
         self.samples = 0             # observations behind `score`
         self.blocks = 0              # times a target refused this exit's IP
@@ -1913,8 +2010,10 @@ class RotatingProxy:
         """One liveness probe.
 
         Returns (alive, latency_ms, error, connect_ok) where `connect_ok` is
-        True when the upstream can open an HTTPS tunnel, False when it
-        refused one (407 etc.), and None when it couldn't be determined.
+        True when the upstream opens an HTTPS tunnel whose certificate
+        verifies (transparent), False when it refused one (407 etc.) *or*
+        served a certificate of its own (an intercepting exit), and None
+        when it couldn't be determined.
         """
         timeout = float(self.settings["probe_timeout"])
         try:
@@ -1975,23 +2074,34 @@ class RotatingProxy:
             return True, latency, "", self._probe_socks_tunnel(node, timeout)
         return True, latency, "", None
 
-    def _probe_socks_tunnel(self, node: Node, timeout: float) -> bool:
-        """SOCKS gives a raw tunnel, so the only question is :443 reachability."""
+    def _probe_socks_tunnel(self, node: Node, timeout: float) -> bool | None:
+        """SOCKS gives a raw tunnel, so dial it -- and then look at the certificate.
+
+        Opening the tunnel only proves reachability; the TLS handshake on
+        top is what says whether the exit forwards bytes untouched.
+        """
         try:
-            sock = _socks_dial(node.proto, node.address, "example.com", 443, timeout)
+            sock = _socks_dial(node.proto, node.address, _TLS_PROBE_HOST, 443,
+                               timeout)
         except Exception:
             return False
         try:
-            sock.close()
-        except OSError:
-            pass
-        return True
+            return _probe_tls(sock, timeout)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def _probe_connect(self, node: Node, timeout: float) -> bool | None:
-        """Second opinion: will this upstream open a CONNECT tunnel?
+        """Second opinion: will this upstream open a clean CONNECT tunnel?
 
         Most free proxies serve plain HTTP but answer 407 to CONNECT, which
-        is exactly why HTTPS requests used to fail at random.
+        is exactly why HTTPS requests used to fail at random.  A 2xx only
+        says the exit opened a byte pipe, though -- `_probe_tls` then asks
+        whether the certificate that comes back is the real one, so an exit
+        that terminates TLS itself is marked as unusable for `https_only`
+        instead of being handed the client's HTTPS traffic.
         """
         sock = None
         try:
@@ -2003,7 +2113,8 @@ class RotatingProxy:
             head, _ = _read_header_block(sock, limit=8192)
             parts = head.split(b"\r\n", 1)[0].split(b" ", 2)
             if len(parts) >= 2 and parts[1][:1] == b"2":
-                return True
+                # the pipe is open -- the certificate decides the verdict
+                return _probe_tls(sock, timeout)
             if len(parts) >= 2 and parts[1] in (UPSTREAM_REJECTIONS | {b"400", b"403"}):
                 return False
             return None

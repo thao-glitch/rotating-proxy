@@ -298,8 +298,16 @@ which is what every `https://` site needs. The **HTTPS** chip in the pool's
 *Use* row keeps rotation on upstreams that can actually tunnel:
 
 * **It knows** — a health check reports each node's tunnel support
-  (`probe_connect`, on by default); a node that proved it *cannot* tunnel is
-  dropped, nodes not yet probed stay in play until they are checked.
+  (`probe_connect`, on by default), and it does not stop at the `200`: the
+  probe handshakes **through** the open tunnel with the system trust store,
+  so the certificate that comes back has to be the real one. Three
+  outcomes, and only three: *refused to tunnel* or *answered with a
+  certificate it minted itself* (the *"self-signed certificate in
+  certificate chain"* a browser reports as no internet) marks the node
+  unusable; a tunnel that dropped or timed out mid-handshake is
+  inconclusive and stays in play; a certificate that verifies says the exit
+  only forwards bytes. **HTTPS only** then excludes the first kind, which
+  is what makes it worth turning on.
 * **It stacks with the country** — Germany + HTTPS only means both, and the
   log says so: `selection scope: exit Germany (DE) · HTTPS-capable only`.
 * **The tally follows** — `237/600 alive · 86 https-capable · exit DE ·
@@ -516,8 +524,12 @@ full-width cards underneath.
 
 Free proxies are unreliable and some of them intercept TLS, which makes
 certificate verification fail (curl reports *"self-signed certificate in
-certificate chain"*). That is the upstream, not this proxy — for a quick test
-`curl -k` gets past it, but don't route anything you care about through them.
+certificate chain"*). That is the upstream, not this proxy — the panel's
+probe detects exactly that (it handshakes through every open tunnel and
+checks the certificate), so with the **HTTPS** chip on, intercepting exits
+are dropped from rotation instead of being handed your traffic; for a quick
+test without it, `curl -k` gets past a bad certificate, but don't route
+anything you care about through them.
 A tunnel can also be dropped the moment it is established (curl's
 *"TLS connect error / unexpected eof"*): the engine evicts that node, and the
 next request rotates onto another one — expect an occasional retry on a free
@@ -531,7 +543,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 563 checks
+That is the whole procedure: the `release` workflow runs the 572 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -547,12 +559,12 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 262 checks
+python3 test_engine.py                 # 271 checks
 xvfb-run -a python3 test_gui.py        # 182 checks (needs a display or Xvfb)
 python3 test_proxyctl.py               # 119 checks
 ```
 
-563 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+572 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
 cascade, country or HTTPS-only flag from a real session can never leak into
 the checks. The geo lookups the cascade tests need are stubbed, so the suite
