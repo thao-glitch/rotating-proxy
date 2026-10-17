@@ -5,9 +5,13 @@ A local forwarding proxy that rotates across a pool of free upstream proxies
 in front of it.
 
 * Point any application at `http://127.0.0.1:8888` — or run `./proxyctl on`
-  to point the whole machine at it (shell/GTK apps, Firefox, Brave/Chromium)
-* The pool is health-checked in the background and dead upstreams are evicted
-  automatically; requests fail over to the next candidate
+  to point the whole machine at it (Windows: the user environment and the
+  system proxy, macOS: `~/.zshrc` + `networksetup`, Linux: `~/.profile` +
+  `.desktop` launchers) — or set *Listen host* to `0.0.0.0` in *Settings* and
+  point a phone at it over Wi-Fi or a hotspot
+* The pool is health-checked in the background, upstreams that fail ten
+  probes in a row are dropped after **every** sweep, and requests fail over
+  to the next candidate
 * HTTPS works through upstreams that support tunnels — and those are preferred
   over ones that don't, so a single HTTPS request can't burn its retries on
   proxies that answer `407 Proxy Authentication Required`
@@ -17,9 +21,10 @@ in front of it.
 * **Every upstream is categorised** — a rolling score (Strong / Good / Weak /
   New), latency with a *Fast* filter, a world *Region* filter, HTTPS support
   and live country counts, all sortable and filterable in the pool table
-* **The pool restocks itself**: fresh proxies are pulled from plain-text
-  lists every few hours, long-dead entries are dropped, and *Proxy →
-  Refresh proxy list now* does it immediately
+* **The pool restocks itself**: six plain-text lists from three independent
+  scrapers are merged every few hours, long-dead entries are dropped after
+  each health sweep, and a pool that has thinned out refetches itself
+  before it runs dry — *Proxy → Refresh proxy list now* does it immediately
 
 ```
 $ python3 run.py            # opens the desktop panel
@@ -164,39 +169,82 @@ the scope), `1` otherwise — an empty scope prints
 
 ## Pointing apps, browsers and the whole system at it
 
-`proxyctl` flips three independent, reversible switches:
+`proxyctl` flips three independent, reversible switches. What each switch
+*is* follows the operating system this copy runs on, because each platform
+keeps those settings somewhere else — the panel's dialog and `./proxyctl
+status` describe them in the words of the machine you are on, and a Windows
+install never gets told to edit `~/.xsessionrc`:
 
-| Switch | What it changes | Turn off with |
-| --- | --- | --- |
-| **environment** | exports `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` from `~/.config/rotating-proxy/env.sh`, plus a guarded block in `~/.profile` and `~/.xsessionrc` so every new login and GUI session inherits them | `./proxyctl env off` |
-| **Firefox** | appends `network.proxy.*` prefs to `user.js` in every Firefox profile (the first run also drops a `user.js.proxybak` safety net) | `./proxyctl firefox off` |
-| **browsers** | copies the Brave/Chromium launcher to `~/.local/share/applications/…-rotating-proxy.desktop` with `--proxy-server=…` on *every* `Exec=`, including its New Window and Incognito actions | `./proxyctl browsers off` |
+| Switch | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| **environment** | `setx` writes `http_proxy` and friends into `HKCU\Environment`, so new cmd, PowerShell, Python and curl windows pick them up | a marked block in `~/.zshrc` and `~/.bashrc` | a marked block in `~/.profile` and `~/.xsessionrc`, read by every new login and GUI session |
+| **Firefox** | every profile under `%APPDATA%\Mozilla\Firefox` | every profile under `~/Library/Application Support/Firefox` | every profile under `~/.mozilla/firefox` |
+| **browsers** | the WinINET values (`ProxyEnable`, `ProxyServer`, `ProxyOverride`) that Edge, Chrome and most Windows apps follow; whatever was set before is backed up first and put back on `off` | `networksetup` points the network service you are actually using (the one behind the default route) at the proxy | copies the Brave/Chromium launcher to `~/.local/share/applications/…-rotating-proxy.desktop` with `--proxy-server=…` on *every* `Exec=`, including its New Window and Incognito actions |
+
+Turn any of them off with `./proxyctl <layer> off` (or the button in the
+dialog):
 
 ```bash
 ./proxyctl on            # all three at once
 ./proxyctl off           # undo all three
 ./proxyctl status        # what is pointed where, where traffic exits,
-                         # and is the proxy answering
+                         # is the proxy answering, and the address a
+                         # phone or another device would dial
 ./proxyctl env on        # or one layer at a time
 ./proxyctl firefox on
 ./proxyctl browsers on
 ./proxyctl printenv      # the export block, for a one-off shell
 ```
 
-The same three switches live in the panel: press **🌐 Apps** in the sidebar
-(or *Proxy → Point apps at this proxy…*), which shows the live status of each
-layer and has **Point everything at this proxy** / **Take everything off**.
+On Windows the installed build ships the same tool as `proxyctl.exe`, so
+run `proxyctl on` instead of `./proxyctl on`.
+
+The same three switches live in the panel: press **🌐 Point apps here** in
+the sidebar (or *Proxy → Point apps at this proxy…*), which shows the live
+status of each layer and has **Point everything at this proxy** / **Take
+everything off**.
+
+### From a phone or another device
+
+The proxy answers on `127.0.0.1` by default, which only this machine can
+dial — so the dialog and `./proxyctl status` say exactly that instead of
+offering an address that could never work. To use the pool from a phone
+(over mobile data through the same hotspot, or the same Wi-Fi):
+
+1. *Settings → Listen host* = `0.0.0.0`, then save — the proxy restarts.
+2. The *Point apps* dialog and `./proxyctl status` now list what to dial,
+   with a *Copy* button and a note about where the address belongs, e.g.
+
+   ```
+   http://192.168.1.23:8888   local network
+   http://172.20.10.5:8888    phone hotspot
+   ```
+3. On Android: *Wi-Fi → the network → Proxy → Manual*. On iPhone: *(i) →
+   Configure Proxy → Manual*. Host and port from the line above; HTTP proxy,
+   no PAC.
+4. Set the exit scope (*Exit via*) as usual — it is enforced here, so the
+   phone's traffic leaves from the same country/state as this machine's.
+
+On this machine itself, keep using `http://127.0.0.1:8888`: the panel
+publishes the dialable address separately rather than replacing the
+loopback one.
+
+Out of scope, deliberately: this is a proxy, not an SMS gateway — receiving
+texts or temporary numbers for account verification is not something it
+does.
 
 Worth knowing:
 
 * The environment layer only reaches **new** sessions. For the shell you are
   already in, run `. ~/.config/rotating-proxy/env.sh` — the Apps dialog has a
-  *Copy* button for that exact line.
+  *Copy* button for that exact line (on Windows, open a new terminal
+  instead: the old window keeps its values).
 * Firefox must be restarted to pick up `user.js`.
-* Browsers that ignore `http_proxy` (Brave/Chromium) get a second menu entry
-  instead — *Brave Web Browser (via rotating proxy)*. Starting one from a
-  terminal works the same way:
-  `brave-browser --proxy-server=http://127.0.0.1:8888`
+* On Linux, browsers that ignore `http_proxy` (Brave/Chromium) get a second
+  menu entry instead — *Brave Web Browser (via rotating proxy)*. Starting one
+  from a terminal works the same way:
+  `brave-browser --proxy-server=http://127.0.0.1:8888`. On Windows and
+  macOS there is no second entry: the system-proxy switch covers them.
 * `no_proxy` keeps `127.0.0.1,localhost,::1,.local` direct, so the panel and
   local services are never sent through the pool.
 * The address is read from `proxy_state.json`, so change the port in
@@ -507,16 +555,29 @@ engine reloads fresh ones from plain-text lists **while it runs**:
   and health-checks the additions straight away. Each pass is logged:
   `proxy list refreshed (interval): +132 new, 18 stale dropped (731
   configured)`.
-* **Built-in sources** — two well-maintained public lists (HTTP and SOCKS5)
-  ship as the default, so a fresh install restocks itself out of the box.
-  Point it at your own lists with *Refresh list from URL(s)* in *Settings*
-  or `--refresh-url` on the command line (comma-separated; `""` switches the
-  feature off). A URL whose name contains `socks5`/`socks4` tags bare
-  `host:port` lines with that scheme; everything else is read as HTTP.
-* **Bounded growth** — an entry that stays dead for 10 consecutive probes is
-  pruned on the next refresh, so the pool neither stagnates nor grows
-  without bound. A later list may re-add it; it then starts over as *New*
-  and earns its place again.
+* **Built-in sources** — six lists from three independent scrapers ship as
+  the default (`TheSpeedX` HTTP/SOCKS4/SOCKS5, `monosans` HTTP and SOCKS5 —
+  checked before publishing — and `clarketm`'s raw HTTP list), so a fresh
+  install restocks itself out of the box and one source going quiet just
+  means the others carry it. Point it at your own lists with *Refresh list
+  from URL(s)* in *Settings* or `--refresh-url` on the command line
+  (comma-separated; `""` switches the feature off). A state file still
+  carrying the old two-list default follows the new set on upgrade; any
+  other list you wrote is left exactly as it is. A URL whose name contains
+  `socks5`/`socks4` tags bare `host:port` lines with that scheme; everything
+  else is read as HTTP.
+* **Dropped, not hoarded** — an entry that stays dead for 10 consecutive
+  probes is removed **after every health sweep** (up to every 2 minutes),
+  instead of waiting for the next interval refresh, so the panel stops
+  filling with rows that cannot answer. The log says what went:
+  `dropped 7 dead upstreams that failed 10 times in a row (724 left in the
+  pool)`. A pool is never emptied outright, and a later list may re-add a
+  dropped address; it then starts over as *New* and earns its place again.
+* **Topped up when it thins** — if pruning leaves the pool below 100
+  upstreams, or below half of what it held at the last refresh, the next
+  fetch happens at once rather than at the end of the interval. A 15-minute
+  cooldown and a single-flight guard keep a dead list source from turning
+  into a request storm.
 * **Manual** — *Proxy → Refresh proxy list now* pulls immediately, without
   waiting for the interval.
 * **Failure-proof** — a source that is offline or gone is logged and
@@ -615,7 +676,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-That is the whole procedure: the `release` workflow runs the 611 checks
+That is the whole procedure: the `release` workflow runs the 685 checks
 first, then builds every installer on a native runner (Windows, macOS
 Intel, macOS Apple silicon, Linux, Android) and publishes them together
 as a GitHub Release for the tag. Re-running a finished workflow
@@ -631,12 +692,12 @@ Optional repository secrets:
 ## Tests
 
 ```bash
-python3 test_engine.py                 # 288 checks
-xvfb-run -a python3 test_gui.py        # 204 checks (needs a display or Xvfb)
-python3 test_proxyctl.py               # 119 checks
+python3 test_engine.py                 # 306 checks
+xvfb-run -a python3 test_gui.py        # 213 checks (needs a display or Xvfb)
+python3 test_proxyctl.py               # 166 checks
 ```
 
-611 checks in total. `test_gui.py` starts from the shipped defaults (it backs
+685 checks in total. `test_gui.py` starts from the shipped defaults (it backs
 up and removes `proxy_state.json` first, then restores it), so a leftover exit
 cascade, country or HTTPS-only flag from a real session can never leak into
 the checks. The geo lookups the cascade tests need are stubbed, so the suite
@@ -649,4 +710,6 @@ The first two suites build everything locally (a target HTTP server, a mock
 HTTP proxy and mock SOCKS4/SOCKS5 servers), so no internet access is required
 for them. `test_proxyctl.py` redirects every path it writes to a throwaway
 temp directory, so it never touches your real `~/.profile`, Firefox profiles
-or desktop launchers.
+or desktop launchers; the Windows and macOS layers are exercised with those
+platforms' own calls stubbed (`setx`, `winreg`, `networksetup`), so the
+dispatch itself is covered without a Windows or Mac to run it on.

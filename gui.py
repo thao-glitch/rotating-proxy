@@ -1447,10 +1447,23 @@ class ProxyGUI(tk.Tk):
     def _refresh_stats(self):
         snap = self.engine.snapshot()
 
+        raw_host, port = str(snap["host"]), snap["port"]
+        # bind-any is not an address anyone can dial, so show loopback --
+        # the dialable one, for the phone, is spelled out separately below
+        shown_host = "127.0.0.1" if raw_host in ("0.0.0.0", "::", "*", "") \
+            else raw_host
+        shown = f"http://{shown_host}:{port}"
         self.endpoint_var.set(
-            f"http://{snap['host']}:{snap['port']}   ·   "
-            f"{snap['total']} upstreams configured")
-        self.hint_var.set("Set any app's HTTP/HTTPS proxy to the address above")
+            f"{shown}   ·   {snap['total']} upstreams configured")
+        if raw_host in ("127.0.0.1", "localhost", "::1"):
+            entries = []                    # nothing a phone could dial
+        else:
+            entries, _hint = proxyctl.device_urls(raw_host, port)
+        # a phone cannot dial 127.0.0.1 or 0.0.0.0: name the address it can,
+        # but only when that address differs from the one above
+        phone = (f" — from a phone: {entries[0][0]}"
+                 if entries and entries[0][0] != shown else "")
+        self.hint_var.set(f"Set any app's HTTP/HTTPS proxy to {shown}{phone}")
 
         # status pill: soft tint behind a strong text colour
         if snap["status"] == "running" and snap["checking"]:
@@ -1824,34 +1837,29 @@ class ProxyGUI(tk.Tk):
                    command=save).pack(side="right")
 
     # ----------------------------------------------------------- apps dialog
-    APP_LAYERS = (
-        ("env", "Terminal & system apps",
-         "curl, wget, Python and other GIO/GTK apps (Thunar, file managers, "
-         "…) follow http_proxy. New logins inherit it from ~/.profile and "
-         "~/.xsessionrc."),
-        ("firefox", "Firefox",
-         "Writes the proxy into every Firefox profile's user.js. Restart "
-         "Firefox to pick it up; running ./proxyctl firefox off reverts it."),
-        ("browsers", "Brave / Chromium",
-         "Adds a '<browser> (via rotating proxy)' launcher to your menu that "
-         "starts the browser with --proxy-server, plus its New Window and "
-         "Incognito actions."),
-    )
-
     def _open_apps(self):
         """Point browsers, the terminal and system apps at this proxy."""
-        if self.apps_win and self.apps_win.winfo_exists():
-            self.apps_win.lift()
-            return
+        if self.apps_win is not None:
+            try:
+                if self.apps_win.winfo_exists():
+                    self.apps_win.lift()
+                    return
+            except tk.TclError:
+                pass                        # closed for good: reopen below
+            self.apps_win = None
         win = tk.Toplevel(self)
         win.title("Point apps at this proxy")
         win.configure(bg=BG)
-        win.geometry("640x545")
+        win.geometry("640x660")
         win.transient(self)
         win.grab_set()
         self.apps_win = win
 
         proxyctl.STATE_FILE = STATE_FILE        # follow this panel's port
+        # The layers belong to the platform, not to the panel: the same
+        # dialog on Windows must not be offering to edit ~/.xsessionrc or
+        # to drop Thunar launchers into a menu that does not exist there.
+        layers = proxyctl.layers()
 
         on_fns = {"env": proxyctl.env_on, "firefox": proxyctl.firefox_on,
                   "browsers": proxyctl.browsers_on}
@@ -1879,6 +1887,45 @@ class ProxyGUI(tk.Tk):
                  bg=BG, fg=GREEN if listening else RED,
                  font=F["small"]).pack(side="left", padx=(14, 0))
 
+        # ---- the same proxy, from a phone or another device ------------
+        live_host = str(self.engine.host)
+        entries, hint = proxyctl.device_urls(live_host, self.engine.port)
+        tk.Label(body, text="FROM A PHONE OR ANOTHER DEVICE", bg=BG, fg=MUTED,
+                 font=F["heading"]).pack(anchor="w", pady=(6, 3))
+        if entries:
+            for address, note in entries:
+                row = tk.Frame(body, bg=PANEL_2, highlightbackground=BORDER,
+                               highlightthickness=1)
+                row.pack(fill="x", pady=(0, 5))
+                tk.Label(row, text=address, bg=PANEL_2, fg=CYAN,
+                         font=F["mono"]).pack(side="left", padx=11, pady=7)
+                if note:
+                    tk.Label(row, text=note, bg=PANEL_2, fg=MUTED,
+                             font=F["small"]).pack(side="right", padx=11)
+
+                def copy_address(address=address):
+                    self.clipboard_clear()
+                    self.clipboard_append(address)
+                    self.status_var.set("Proxy address copied to clipboard")
+
+                _btn(row, "Copy", copy_address, "Ghost").pack(side="right",
+                                                              padx=(0, 8),
+                                                              pady=3)
+            tk.Label(body,
+                     text=("Set it as a manual proxy on the device: Android "
+                           "→ Wi‑Fi → Proxy → Manual · iPhone → Configure "
+                           "Proxy → Manual · host above, same port."),
+                     bg=BG, fg=MUTED, font=F["small"],
+                     justify="left", wraplength=560).pack(anchor="w",
+                                                          pady=(1, 6))
+        else:
+            warn = tk.Frame(body, bg=RED_TINT, highlightbackground=BORDER,
+                            highlightthickness=1)
+            warn.pack(fill="x", pady=(0, 6))
+            tk.Label(warn, text=f"⚠  {hint}", bg=RED_TINT, fg=RED,
+                     font=F["small"], justify="left", wraplength=540
+                     ).pack(anchor="w", padx=11, pady=8)
+
         # ---- one row per layer ---------------------------------------
         statuses: dict[str, tk.Label] = {}
 
@@ -1891,7 +1938,7 @@ class ProxyGUI(tk.Tk):
                 lab.configure(text=text,
                               fg=GREEN if text.startswith("on") else MUTED)
 
-        names = {key: title for key, title, _ in self.APP_LAYERS}
+        names = {key: title for key, title, _ in layers}
 
         def apply(key: str, want: bool, announce: bool = True):
             try:
@@ -1905,7 +1952,7 @@ class ProxyGUI(tk.Tk):
                                     f"{'on' if want else 'off'}.")
             return True
 
-        for key, title, blurb in self.APP_LAYERS:
+        for key, title, blurb in layers:
             row = tk.Frame(body, bg=PANEL_2, highlightbackground=BORDER,
                            highlightthickness=1)
             row.pack(fill="x", pady=(0, 9))
@@ -1954,7 +2001,7 @@ class ProxyGUI(tk.Tk):
                                                      pady=4)
 
         def apply_all(want: bool):
-            for key, _, _ in self.APP_LAYERS:
+            for key, _, _ in layers:
                 if not apply(key, want, announce=False):
                     return
             self.status_var.set("All layers turned "

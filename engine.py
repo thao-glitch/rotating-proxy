@@ -59,6 +59,28 @@ import geodb
 # ---------------------------------------------------------------------------
 # tunables (defaults; the GUI exposes all of them)
 # ---------------------------------------------------------------------------
+# Where fresh upstreams come from, in order.  Free proxies die constantly,
+# so the pool restocks itself from six lists belonging to three independent
+# scrapers: one source going quiet just means the others carry it.  Every
+# URL below was checked to serve bare `host:port` rows; the `socks4` /
+# `socks5` in the path is the only signal that those rows are SOCKS.
+REFRESH_SOURCES = (
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+)
+
+# The shipped default used to be just the first pair above.  A state file
+# still carrying *exactly that old default* follows the new set (see
+# `_validate_refresh_url`); a list you pointed at yourself is never touched.
+LEGACY_REFRESH_SOURCES = (
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+)
+
 DEFAULTS = {
     "host": "127.0.0.1",
     "port": 8888,
@@ -77,17 +99,16 @@ DEFAULTS = {
     "rotate_on": "403,429,999",  # origin statuses that rotate onto another exit
     # plain-text proxy list URLs to auto-reload while running ("" = off);
     # free proxies die constantly, so the pool restocks itself
-    "refresh_url": ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/"
-                    "master/http.txt,"
-                    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/"
-                    "master/socks5.txt"),
+    "refresh_url": ", ".join(REFRESH_SOURCES),
     "refresh_interval": 21600,   # seconds between list refreshes (6 h)
 }
 
 MAX_HEADER_BYTES = 65536
 RELAY_CHUNK = 65536
 BUFFER_CAP = 5000             # log lines kept in memory for the GUI
-STALE_AFTER = 10              # failed probes before a list refresh drops an entry
+STALE_AFTER = 10              # failed probes before an entry is dropped
+RESTOCK_FLOOR = 100           # thin enough to fetch fresh upstreams at once
+RESTOCK_COOLDOWN = 900        # seconds between automatic restocks
 FAST_MS = 300.0               # latency at or below this counts as "fast"
 USE_FLAGS = ("http", "socks4", "socks5", "strong", "fast")  # routing scope
 
@@ -439,6 +460,13 @@ def _validate_refresh_url(value) -> str:
     """
     parts = [chunk for chunk in re.split(r"[,\s]+", str(value or "").strip())
              if chunk]
+    if tuple(parts) in LEGACY_REFRESH_SOURCES:
+        # the shipped default grew from two lists to six: a state file
+        # still carrying the *old shipped default* follows it, so an
+        # upgraded install restocks from the same place a new one does.
+        # Any other value -- including a hand-written subset -- is kept
+        # exactly as it is.
+        parts = list(REFRESH_SOURCES)
     for chunk in parts:
         if not re.match(r"^https?://", chunk, re.I):
             raise ValueError(
@@ -1110,6 +1138,7 @@ class RotatingProxy:
         self._stop = threading.Event()
         self._checking = threading.Event()
         self._verifying = threading.Event()    # exit-verification pass
+        self._restocking = False               # one auto-restock at a time
 
         self._nodes: list[Node] = []
         self._cc_hints: dict[str, str] = {}   # label -> country from an import
@@ -1131,6 +1160,7 @@ class RotatingProxy:
             "started_at": 0.0,
             "last_check_at": 0.0,
             "last_refresh_at": 0.0,
+            "pool_at_refresh": 0,              # pool size at that moment
             "check_progress": (0, 0),
         }
 
@@ -2501,6 +2531,18 @@ class RotatingProxy:
                         if usable else
                         f" · HTTPS-only: none of these {total} can tunnel")
             self.log("info", msg)
+            # free proxies die between refreshes, so the pool is cleaned
+            # after every sweep instead of at the next interval, and topped
+            # up right away when dropping them left it thin
+            pruned = self._prune_stale()
+            if pruned:
+                with self._lock:
+                    left = len(self._nodes)
+                self.log("info", f"dropped {pruned} dead upstream"
+                                 f"{'' if pruned == 1 else 's'} that failed "
+                                 f"{STALE_AFTER} times in a row "
+                                 f"({left} left in the pool)")
+                self._maybe_restock()
         except Exception as exc:
             self.log("error", f"health check failed: {exc}")
         finally:
@@ -2542,14 +2584,15 @@ class RotatingProxy:
         return data.decode("utf-8", "replace")
 
     def _prune_stale(self) -> int:
-        """Drop dead entries that keep failing (used by `refresh_list`).
+        """Drop dead entries that keep failing.
 
-        Free lists churn constantly: without this the pool would only ever
-        grow, collecting nodes that died weeks ago.  An entry is stale once
-        it is dead *and* has failed `STALE_AFTER` probes or requests in a
-        row; a single success resets the counter and revives it.  The next
-        refresh may re-add a dropped address -- it then starts fresh as
-        "New" and earns its place again.
+        Runs after every health sweep and inside `refresh_list`: free
+        lists churn constantly, so waiting for the next interval refresh
+        (up to 6 h) would leave a wall of dead rows in the panel.  An
+        entry is stale once it is dead *and* has failed `STALE_AFTER`
+        probes or requests in a row; a single success resets the counter
+        and revives it.  The next refresh may re-add a dropped address --
+        it then starts fresh as "New" and earns its place again.
         """
         with self._lock:
             keep = [n for n in self._nodes
@@ -2561,6 +2604,42 @@ class RotatingProxy:
             if dropped:
                 self._nodes = keep
         return dropped
+
+    def _maybe_restock(self) -> None:
+        """Fetch fresh upstreams when pruning has left the pool thin.
+
+        The interval refresh keeps the pool *growing*; this keeps it from
+        *shrinking* between two of them.  It is due once the pool is below
+        `RESTOCK_FLOOR`, or has lost more than half of what it held at the
+        last refresh -- a big pool should not have to dwindle to 100 before
+        anyone tops it up.  A cooldown and an in-flight flag keep a dead
+        list source from becoming a request storm, and the fetch runs on
+        its own thread so a slow source cannot stall the health sweep.
+        """
+        if not self.refresh_url:
+            return
+        with self._lock:
+            if self._restocking:
+                return
+            floor = RESTOCK_FLOOR
+            at_refresh = int(self.stats.get("pool_at_refresh") or 0)
+            if at_refresh >= 2 * RESTOCK_FLOOR:
+                floor = max(floor, at_refresh // 2)
+            if len(self._nodes) >= floor:
+                return
+            last = float(self.stats.get("last_refresh_at") or 0.0)
+            if time.time() - last < RESTOCK_COOLDOWN:
+                return
+            self._restocking = True
+
+        def work() -> None:
+            try:
+                self.refresh_list(reason="pool running low")
+            finally:
+                with self._lock:
+                    self._restocking = False
+
+        threading.Thread(target=work, name="restock", daemon=True).start()
 
     def refresh_list(self, *, reason: str = "interval") -> tuple[int, int]:
         """Fetch the configured lists and merge whatever is new.
@@ -2605,6 +2684,9 @@ class RotatingProxy:
         with self._lock:
             self.stats["last_refresh_at"] = time.time()
             total = len(self._nodes)
+            # the mark `_maybe_restock` compares against: a pool that
+            # loses half of this before the next refresh gets topped up
+            self.stats["pool_at_refresh"] = total
         if added or pruned:
             self.log("info", f"proxy list refreshed ({reason}): "
                              f"+{added} new, {pruned} stale dropped "

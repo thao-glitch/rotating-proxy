@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import io
 import shutil
+import subprocess
 import tempfile
 import traceback
 from pathlib import Path
@@ -23,7 +24,8 @@ RESULTS = []
 
 # every module global a sandbox has to take over
 SAVED = ("APP_DIR", "ENV_FILE", "OFF_FILE", "ENABLED", "RC_FILES",
-         "DESKTOP_DIR", "SYSTEM_DESKTOP_DIRS", "FF_BASE", "STATE_FILE")
+         "DESKTOP_DIR", "SYSTEM_DESKTOP_DIRS", "FF_BASE", "STATE_FILE",
+         "PLATFORM")
 
 PROXY_URL = "http://127.0.0.1:8888"
 
@@ -85,6 +87,27 @@ def run(fn, *args):
     with contextlib.redirect_stdout(buf):
         result = fn(*args)
     return result, buf.getvalue()
+
+
+@contextlib.contextmanager
+def _platform(name: str, **stubs):
+    """Run a block as `name`, with that platform's OS calls faked.
+
+    Windows and macOS helpers shell out or touch the registry; neither
+    exists on the machine running these tests, so the test supplies the
+    answers and checks what proxyctl asked for.
+    """
+    saved_platform = proxyctl.PLATFORM
+    proxyctl.PLATFORM = name
+    saved = {key: getattr(proxyctl, key) for key in stubs}
+    for key, value in stubs.items():
+        setattr(proxyctl, key, value)
+    try:
+        yield
+    finally:
+        proxyctl.PLATFORM = saved_platform
+        for key, value in saved.items():
+            setattr(proxyctl, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +486,14 @@ def test_status():
         check("unreadable state file reported honestly",
               "unknown (no state file)" in out, out)
         sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1}}')
+        _, out = run(proxyctl.status)
+        check("status says a phone cannot dial a loopback proxy",
+              "phone      not reachable" in out, out)
+        sb.write_state('{"settings": {"host": "0.0.0.0", "port": 1}}')
+        _, out = run(proxyctl.status)
+        check("status shows the phone row either way",
+              any(line.startswith("phone") for line in out.splitlines()), out)
+        sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1}}')
 
 
 def test_cli():
@@ -506,6 +537,9 @@ def test_cli():
               f"{proxyctl.env_status()} / {proxyctl.firefox_status()} / "
               f"{proxyctl.browsers_status()}")
         check("on prints the current-shell hint", "env.sh" in out, out)
+        check("on says what a phone would need",
+              "other devices cannot reach" in out
+              or "From a phone or another device" in out, out)
 
         code, out = run(proxyctl.main, ["off"])
         check("off", code == 0 and "Taking apps off" in out, out)
@@ -513,6 +547,274 @@ def test_cli():
               proxyctl.env_status() == "off"
               and proxyctl.firefox_status() in ("off", "not installed")
               and proxyctl.browsers_status() == "off", out)
+
+
+def test_platform_adaptation():
+    """The same dialog must describe *this* machine's apps, not Kali's.
+
+    The Windows build used to ship the Linux wording (edit ~/.xsessionrc,
+    look for Thunar menu entries) *and* the Linux code paths, so nothing it
+    offered could ever take effect there -- which is exactly how "it still
+    showed the Kali apps" came about.
+    """
+    print("\nplatform adaptation")
+    with Sandbox() as sb:
+        sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1}}')
+        proxy = "http://127.0.0.1:1"
+
+        # ---- the wording itself -----------------------------------------
+        linux = " ".join(f"{t} {b}" for _, t, b in proxyctl.layers())
+        check("linux wording is this machine's own",
+              "xsessionrc" in linux and "Thunar" in linux
+              and "Brave / Chromium" in linux, linux)
+
+        with _platform("win32"):
+            win = proxyctl.layers()
+            win_text = " ".join(f"{t} {b}" for _, t, b in win)
+            check("windows layers drop the linux wording",
+                  not any(bit in win_text
+                          for bit in ("xsessionrc", "Thunar", "~/.mozilla",
+                                      "desktop launcher")),
+                  win_text)
+            check("windows layers name windows apps",
+                  "PowerShell" in win[0][2] and "Edge" in win[2][1], win_text)
+            check("windows has no rc files to splice",
+                  proxyctl.rc_files() == (), str(proxyctl.rc_files()))
+            check("windows firefox lives in APPDATA",
+                  str(proxyctl.firefox_base()).endswith(
+                      "AppData/Roaming/Mozilla/Firefox"),
+                  str(proxyctl.firefox_base()))
+
+        with _platform("darwin"):
+            mac_text = " ".join(f"{t} {b}" for _, t, b in proxyctl.layers())
+            check("macos wording is its own",
+                  "~/.zshrc" in mac_text and "Safari" in mac_text
+                  and "xsessionrc" not in mac_text, mac_text)
+            check("macos shells are zsh and bash",
+                  [p.name for p in proxyctl.rc_files()]
+                  == [".zshrc", ".bashrc"], str(proxyctl.rc_files()))
+            check("macos firefox lives in Library",
+                  str(proxyctl.firefox_base()).endswith(
+                      "Library/Application Support/Firefox"),
+                  str(proxyctl.firefox_base()))
+
+        # ---- layer 1 on Windows: setx + the user's registry --------------
+        store: dict = {}
+        set_calls: list = []
+        del_calls: list = []
+
+        def fake_set(name, value):
+            store[name] = value
+            set_calls.append(name)
+            return True
+
+        def fake_del(name):
+            del_calls.append(name)
+            return store.pop(name, None) is not None
+
+        with _platform("win32", _win_set_var=fake_set,
+                       _win_del_var=fake_del,
+                       _win_env_vars=lambda: dict(store)):
+            touched = proxyctl.env_on()
+            check("windows env sets every variable",
+                  touched == list(proxyctl.PROXY_VARS
+                                  + proxyctl.NO_PROXY_VARS), str(touched))
+            check("windows env points at the proxy",
+                  store.get("http_proxy") == proxy
+                  and store.get("HTTPS_PROXY") == proxy
+                  and store.get("no_proxy") == proxyctl.NO_PROXY_VALUE,
+                  str(store))
+            check("windows env status reads the registry",
+                  proxyctl.env_status() == "on (new windows)",
+                  proxyctl.env_status())
+            check("windows env on again changes nothing",
+                  proxyctl.env_on() == [], str(set_calls))
+            proxyctl.env_off()
+            check("windows env off deletes every variable",
+                  del_calls == list(proxyctl.PROXY_VARS
+                                    + proxyctl.NO_PROXY_VARS)
+                  and not store, str((del_calls, store)))
+            check("windows env off reports off",
+                  proxyctl.env_status() == "off", proxyctl.env_status())
+
+        # ---- layer 3 on Windows: WinINET (the system proxy) --------------
+        inet: dict = {}
+        inet_calls: list = []
+        notes: list = []
+
+        def fake_inet_set(name, value, kind="sz"):
+            inet[name] = value
+            inet_calls.append((name, value, kind))
+            return True
+
+        def fake_inet_get(name):
+            if name not in inet:
+                raise KeyError(name)
+            return inet[name]
+
+        def fake_inet_delete(name):
+            return inet.pop(name, None) is not None
+
+        stubs = dict(_win_inet_set=fake_inet_set,
+                     _win_inet_get=fake_inet_get,
+                     _win_inet_delete=fake_inet_delete,
+                     _win_notify=lambda: notes.append("notified"))
+        with _platform("win32", **stubs):
+            touched = proxyctl.browsers_on()
+            check("windows system proxy set to host:port",
+                  inet.get("ProxyServer") == "127.0.0.1:1", str(inet))
+            check("windows system proxy enabled",
+                  inet.get("ProxyEnable") == 1, str(inet))
+            check("windows bypass list keeps local hosts local",
+                  "<local>" in str(inet.get("ProxyOverride", "")), str(inet))
+            check("windows status reads the WinINET values",
+                  proxyctl.browsers_status() == "on (127.0.0.1:1)",
+                  proxyctl.browsers_status())
+            check("windows tells the os to re-read its settings",
+                  notes == ["notified"], str(notes))
+            check("windows writes no .desktop launchers",
+                  not proxyctl.DESKTOP_DIR.exists()
+                  or not list(proxyctl.DESKTOP_DIR.glob("*.desktop")),
+                  "launchers written")
+            check("previous system settings backed up",
+                  proxyctl._win_backup_file().exists(),
+                  str(proxyctl._win_backup_file()))
+            check("windows system on again changes nothing",
+                  proxyctl.browsers_on() == [], str(inet_calls))
+
+            proxyctl.browsers_off()
+            check("windows off removes what it added",
+                  "ProxyEnable" not in inet and "ProxyServer" not in inet,
+                  str(inet))
+            check("windows off drops the backup",
+                  not proxyctl._win_backup_file().exists(),
+                  str(proxyctl._win_backup_file()))
+            check("windows status after off",
+                  proxyctl.browsers_status() == "off",
+                  proxyctl.browsers_status())
+
+            # a proxy that was already configured must come back unchanged
+            inet.update({"ProxyEnable": 0, "ProxyServer": "corp:8080"})
+            proxyctl.browsers_on()
+            proxyctl.browsers_off()
+            check("windows off restores the settings it found",
+                  inet.get("ProxyEnable") == 0
+                  and inet.get("ProxyServer") == "corp:8080"
+                  and "ProxyOverride" not in inet, str(inet))
+
+        # ---- layer 3 on macOS: networksetup ------------------------------
+        mac_calls: list = []
+
+        def fake_mac_run(args):
+            mac_calls.append(list(args))
+            return True
+
+        with _platform("darwin", _mac_run=fake_mac_run,
+                       _mac_service=lambda: "Wi-Fi",
+                       _mac_capture=lambda args: "\n".join(
+                           ("Enabled: Yes", "Server: 127.0.0.1", "Port: 1"))
+                       if args[:1] == ["-getwebproxy"] else ""):
+            proxyctl.browsers_on()
+            check("macos points the active service at host:port",
+                  ["-setwebproxy", "Wi-Fi", "127.0.0.1", "1"] in mac_calls
+                  and ["-setsecurewebproxy", "Wi-Fi", "127.0.0.1", "1"]
+                  in mac_calls, str(mac_calls))
+            check("macos also sets socks and the bypass list",
+                  len(mac_calls) == 4
+                  and mac_calls[3][0] == "-setproxybypassdomains",
+                  str(mac_calls))
+            check("macos status reads networksetup",
+                  proxyctl.browsers_status() == "on (127.0.0.1:1)",
+                  proxyctl.browsers_status())
+            mac_calls.clear()
+            proxyctl.browsers_off()
+            check("macos off switches each proxy off",
+                  [c[0] for c in mac_calls]
+                  == ["-setwebproxystate", "-setsecurewebproxystate",
+                      "-setsocksfirewallproxystate"], str(mac_calls))
+
+        # ---- which macOS service gets the settings -----------------------
+        order = ("(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n\n"
+                 "(2) USB LAN\n(Hardware Port: USB LAN, Device: en5)\n")
+
+        class _Proc:
+            def __init__(self, code, out=""):
+                self.returncode, self.stdout = code, out
+                self.stderr = ""
+
+        def fake_exec(cmd, **_kw):
+            if cmd and cmd[0] == "route":
+                return _Proc(0 if route_ok else 1,
+                             "   interface: en0\n" if route_ok else "")
+            if cmd and cmd[0] == "networksetup":
+                return _Proc(0, order)
+            return _Proc(1, "")
+
+        for route_ok, want, why in ((True, "Wi-Fi", "default route"),
+                                    (False, "Wi-Fi", "first service")):
+            fake_mod = type("fake_subprocess", (), {})()
+            fake_mod.run = fake_exec
+            fake_mod.SubprocessError = subprocess.SubprocessError
+            with _platform("darwin", subprocess=fake_mod):
+                got = proxyctl._mac_service()
+            check(f"macos service follows the {why}",
+                  got == want, got)
+
+
+def test_device_urls():
+    """A phone can only dial in when the proxy listens beyond loopback."""
+    print("\naddresses for other devices")
+    with Sandbox() as sb:
+        sb.write_state('{"settings": {"host": "127.0.0.1", "port": 1}}')
+        entries, hint = proxyctl.device_urls()
+        check("loopback bind offers no address", entries == [], str(entries))
+        check("loopback bind explains the setting to change",
+              "0.0.0.0" in hint, hint)
+        check("bind host reports the raw interface",
+              proxyctl.bind_host() == "127.0.0.1", proxyctl.bind_host())
+        check("listen address still maps bind-any to loopback",
+              proxyctl.listen_address() == ("127.0.0.1", 1),
+              str(proxyctl.listen_address()))
+
+        sb.write_state('{"settings": {"host": "0.0.0.0", "port": 9050}}')
+        with _platform("linux",
+                       reachable_addresses=lambda: ["192.168.1.23"]):
+            entries, hint = proxyctl.device_urls()
+            check("bind-any lists an address another device can dial",
+                  entries == [("http://192.168.1.23:9050", "local network")],
+                  str((entries, hint)))
+            check("no nagging when there is an address to give", hint == "",
+                  hint)
+            check("bind-any is kept raw for the reachability test",
+                  proxyctl.bind_host() == "0.0.0.0", proxyctl.bind_host())
+
+        with _platform("linux",
+                       reachable_addresses=lambda: ["172.20.10.5"]):
+            entries, _hint = proxyctl.device_urls()
+            check("a phone hotspot is labelled as one",
+                  entries == [("http://172.20.10.5:9050", "phone hotspot")],
+                  str(entries))
+
+        with _platform("linux", reachable_addresses=lambda: []):
+            entries, hint = proxyctl.device_urls()
+            check("nothing to give says so instead of inventing an address",
+                  entries == [] and "no address" in hint,
+                  str((entries, hint)))
+
+        sb.write_state('{"settings": {"host": "10.1.2.3", "port": 9050}}')
+        entries, hint = proxyctl.device_urls()
+        check("a fixed interface is offered as-is",
+              entries == [("http://10.1.2.3:9050", "local network")],
+              str((entries, hint)))
+
+        # the real lookup: loopback and link-local would never work for a phone
+        addrs = proxyctl.reachable_addresses()
+        check("reachable addresses are never loopback or link-local",
+              isinstance(addrs, list)
+              and not any(a.startswith(("127.", "169.254.")) for a in addrs),
+              str(addrs))
+        check("reachable addresses are listed once",
+              len(addrs) == len(set(addrs)), str(addrs))
 
 
 def main() -> int:
@@ -530,6 +832,8 @@ def main() -> int:
         test_no_browser,
         test_status,
         test_cli,
+        test_platform_adaptation,
+        test_device_urls,
     ]
 
     for t in tests:

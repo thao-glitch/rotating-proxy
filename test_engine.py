@@ -1958,6 +1958,154 @@ def test_list_refresh():
         httpd.shutdown()
 
 
+def test_pool_restock(mock_port, dead_port):
+    """Dead proxies are dropped after every sweep, and the pool tops up.
+
+    Free upstreams die *between* refreshes: waiting for the next interval
+    (up to 6 h) would leave the panel full of dead rows, and a pool that
+    keeps shrinking needs fresh entries before it runs dry rather than
+    after.  The shipped list set grew with the feature, so a state file
+    still carrying the old default has to follow along.
+    """
+    print("\ndead-proxy pruning and auto-restock")
+    import engine as eng_mod
+
+    # ---- the shipped list set, and the migration off the old one --------
+    check("six shipped list sources", len(eng_mod.REFRESH_SOURCES) == 6,
+          str(len(eng_mod.REFRESH_SOURCES)))
+    check("no source listed twice",
+          len(set(eng_mod.REFRESH_SOURCES)) == len(eng_mod.REFRESH_SOURCES))
+    check("shipped default is the whole set",
+          eng_mod.DEFAULTS["refresh_url"]
+          == ", ".join(eng_mod.REFRESH_SOURCES),
+          eng_mod.DEFAULTS["refresh_url"])
+    migrated = eng_mod._validate_refresh_url(
+        ", ".join(eng_mod.LEGACY_REFRESH_SOURCES[0]))
+    check("the old shipped default follows the new one",
+          migrated == ", ".join(eng_mod.REFRESH_SOURCES), migrated)
+    mine = "https://example.com/a.txt, https://example.com/b.txt"
+    check("a list of your own is left alone",
+          eng_mod._validate_refresh_url(mine) == mine,
+          eng_mod._validate_refresh_url(mine))
+    check("off stays off", eng_mod._validate_refresh_url("") == "")
+
+    # ---- every sweep drops what is past saving --------------------------
+    logs: list = []
+    eng = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                        proxies=[f"127.0.0.1:{mock_port}",
+                                 f"127.0.0.1:{dead_port}"],
+                        probe_timeout=2.0)
+    eng.configure(refresh_url="")          # nothing may reach the network
+    stale = next(n for n in eng._nodes if n.label == f"127.0.0.1:{dead_port}")
+    stale.status, stale.failures = "dead", eng_mod.STALE_AFTER - 1
+    eng.check_now(reason="test")
+    deadline = time.time() + 25
+    while eng.checking and time.time() < deadline:
+        time.sleep(0.05)
+    labels = eng.proxies()
+    check("a proxy that keeps failing is dropped by the sweep",
+          f"127.0.0.1:{dead_port}" not in labels, str(labels))
+    check("the working one survives the drop",
+          f"127.0.0.1:{mock_port}" in labels, str(labels))
+    check("the drop is logged",
+          any("dropped" in m and "dead upstream" in m for _, m in logs),
+          str(logs[-3:]))
+
+    # a pool where *everything* is past saving is never emptied outright
+    all_dead = RotatingProxy(logger=quiet, probe_timeout=2.0,
+                             proxies=[f"127.0.0.1:{dead_port}"],
+                             refresh_url="")
+    only = all_dead._nodes[0]
+    only.status, only.failures = "dead", eng_mod.STALE_AFTER - 1
+    all_dead.check_now(reason="test")
+    deadline = time.time() + 25
+    while all_dead.checking and time.time() < deadline:
+        time.sleep(0.05)
+    check("the pool is never emptied outright",
+          all_dead.proxies() == [f"127.0.0.1:{dead_port}"],
+          str(all_dead.proxies()))
+
+    # ---- the pool tops itself up when pruning left it thin --------------
+    import http.server
+
+    http_list = "198.51.100.60:8080\n198.51.100.61:3128\n"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            data = http_list.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_a):               # keep the output clean
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    logs2: list = []
+    try:
+        thin = RotatingProxy(logger=lambda l, m: logs2.append((l, m)),
+                             proxies=["192.0.2.70:8080"],
+                             refresh_url=f"{base}/list.txt")
+        thin._maybe_restock()
+        deadline = time.time() + 15
+        while (thin.stats["last_refresh_at"] == 0 or thin._restocking) \
+                and time.time() < deadline:
+            time.sleep(0.05)
+        check("a thin pool restocks itself at once",
+              len(thin.proxies()) == 3, str(thin.proxies()))
+        check("the restock is logged",
+              any("pool running low" in m for _, m in logs2),
+              str(logs2[-2:]))
+        check("the restock released its lock",
+              not thin._restocking, str(thin._restocking))
+        check("pool size remembered for the next comparison",
+              thin.stats["pool_at_refresh"] == 3,
+              str(thin.stats["pool_at_refresh"]))
+
+        # a cooldown stops a dead list source turning into a request storm
+        before = thin.stats["last_refresh_at"]
+        thin._maybe_restock()
+        time.sleep(0.2)
+        check("cooldown blocks an immediate second fetch",
+              thin.stats["last_refresh_at"] == before,
+              str(thin.stats["last_refresh_at"] - before))
+
+        big = RotatingProxy(logger=quiet,
+                            proxies=[f"192.0.2.{i}:{8000 + i}"
+                                     for i in range(1, 150)],
+                            refresh_url=f"{base}/list.txt")
+        big.stats["pool_at_refresh"] = 200         # half of it = the floor
+        big._maybe_restock()
+        time.sleep(0.3)
+        check("a pool above the floor is fetched for only when it thins",
+              big.stats["last_refresh_at"] == 0 and not big._restocking,
+              str(big.stats["last_refresh_at"]))
+
+        # ...but a big pool that has lost more than half tops up early
+        big.stats["pool_at_refresh"] = 300          # half of it > the pool
+        big._maybe_restock()
+        deadline = time.time() + 15
+        while (big.stats["last_refresh_at"] == 0 or big._restocking) \
+                and time.time() < deadline:
+            time.sleep(0.05)
+        check("a pool that halved restocks itself",
+              len(big.proxies()) == 151, str(len(big.proxies())))
+
+        big.configure(refresh_url="")
+        big.stats["last_refresh_at"] = 0
+        big._maybe_restock()
+        time.sleep(0.2)
+        check("no restock at all when refreshing is off",
+              big.stats["last_refresh_at"] == 0,
+              str(big.stats["last_refresh_at"]))
+    finally:
+        httpd.shutdown()
+
+
 def test_use_scope():
     """The routing scope (`use_only`): which proxies may be used at all."""
     print("\nrouting scope (use flags)")
@@ -2130,6 +2278,7 @@ def main():
         test_header_hygiene,
         lambda: test_expect_continue(target_port, mock_port),
         test_list_refresh,
+        lambda: test_pool_restock(mock_port, dead_port),
         test_lifecycle,
     ]
 

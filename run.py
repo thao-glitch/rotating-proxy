@@ -44,10 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Real-time rotating HTTP/HTTPS proxy with a desktop panel.",
         formatter_class=_Help,
         epilog="once it is running, point the rest of the machine at it:\n"
-               "  ./proxyctl on       shell/GTK apps, Firefox, Brave/Chromium\n"
+               "  ./proxyctl on       its terminal, browser and system apps\n"
                "  ./proxyctl off      undo all of that\n"
-               "  ./proxyctl status   what is pointed where\n"
-               "(the panel has the same switches behind its Apps button)")
+               "  ./proxyctl status   what is pointed where, plus the address\n"
+               "                      a phone or another device would dial\n"
+               "(the panel has the same switches behind its Point apps button;\n"
+               "to reach the proxy from a phone, first set Listen host to\n"
+               "0.0.0.0 in Settings -- 127.0.0.1 only answers this machine)")
     p.add_argument("--cli", action="store_true",
                    help="run headless instead of opening the GUI")
     p.add_argument("--check", action="store_true",

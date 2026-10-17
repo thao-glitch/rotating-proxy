@@ -8,18 +8,34 @@ proxy, and take them off again.
     ./proxyctl status            what is currently pointed where
     ./proxyctl env on|off        shell, terminal and GIO/GTK apps
     ./proxyctl firefox on|off    Firefox's own proxy preferences
-    ./proxyctl browsers on|off   Brave / Chromium desktop launcher
+    ./proxyctl browsers on|off   the system proxy, or .desktop launchers
     ./proxyctl printenv          print the export block (for a one-off shell)
 
 Every change is reversible and marked so it can be found and removed again.
 The proxy address is read from proxy_state.json, so if you change the port in
-the GUI, `./proxyctl on` follows it.
+the GUI, `./proxyctl on` follows it.  (The Windows build ships this script as
+`proxyctl.exe`, so drop the `./` there; macOS and Linux run `./proxyctl`.)
+
+What the three layers *are* follows the OS this copy runs on, because the
+settings each platform keeps in a different place:
+
+    Windows   setx for the environment, HKCU\\Environment + WinINET keys for
+              the system proxy, %APPDATA%\\Mozilla\\Firefox for profiles
+    macOS     ~/.zshrc + ~/.bashrc, `networksetup` for the system proxy,
+              ~/Library/Application Support/Firefox for profiles
+    Linux     ~/.profile + ~/.xsessionrc, .desktop launchers, ~/.mozilla
+
+`status` and the panel's "Point apps here" dialog also print the addresses a
+phone or another device can dial -- but only when the proxy is configured to
+listen on something other than 127.0.0.1 (Settings -> Listen interface).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -38,7 +54,8 @@ STATE_FILE = state_file()
 MARK_START = "# >>> rotating-proxy >>>"
 MARK_END = "# <<< rotating-proxy <<<"
 
-# rc files that decide what a login/GUI session inherits
+# rc files that decide what a login/GUI session inherits -- Linux; the
+# per-OS view of these paths is `rc_files()` / `firefox_base()` below
 RC_FILES = (Path.home() / ".profile", Path.home() / ".xsessionrc")
 
 DESKTOP_DIR = Path.home() / ".local" / "share" / "applications"
@@ -61,21 +78,93 @@ NO_PROXY_VALUE = "127.0.0.1,localhost,::1,.local"
 
 
 # ---------------------------------------------------------------------------
+# which OS are we pointing at?
+# ---------------------------------------------------------------------------
+# Everything below branches on it.  A Windows or macOS build used to run the
+# Linux code unchanged -- splicing ~/.profile, hunting for ~/.mozilla and
+# writing .desktop launchers -- so nothing it did could ever take effect on
+# the machine it was installed on.  Tests patch PLATFORM to walk the other
+# platforms from this one.
+PLATFORM = sys.platform
+
+# where the environment layer lives, and where Firefox keeps its profiles
+WIN_FF_BASE = Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox"
+MAC_FF_BASE = Path.home() / "Library" / "Application Support" / "Firefox"
+MAC_RC_FILES = (Path.home() / ".zshrc", Path.home() / ".bashrc")
+
+
+def is_windows() -> bool:
+    return PLATFORM == "win32"
+
+
+def is_macos() -> bool:
+    return PLATFORM == "darwin"
+
+
+def rc_files() -> tuple[Path, ...]:
+    """The files a new session reads to pick up environment settings.
+
+    Empty on Windows, which keeps per-user environment variables in the
+    registry instead (see `_win_env_on`) -- there is no rc file to splice.
+    """
+    if is_windows():
+        return ()
+    if is_macos():
+        return MAC_RC_FILES
+    return RC_FILES
+
+
+def firefox_base() -> Path:
+    """Where `profiles.ini` lives on this OS (tested through FF_BASE on
+    Linux, so a sandbox still redirects it)."""
+    if is_windows():
+        return WIN_FF_BASE
+    if is_macos():
+        return MAC_FF_BASE
+    return FF_BASE
+
+
+# ---------------------------------------------------------------------------
 # proxy address
 # ---------------------------------------------------------------------------
-def listen_address() -> tuple[str, int]:
-    """(host, port) the engine is configured to bind on."""
-    host, port = "127.0.0.1", 8888
+def _settings() -> dict:
+    """The engine's settings as stored, or {} when there is no readable one."""
     try:
         settings = json.loads(STATE_FILE.read_text(encoding="utf-8"))["settings"]
-        host = str(settings.get("host", host)).strip() or host
-        port = int(settings.get("port", port))
     except (OSError, ValueError, KeyError, TypeError):
-        pass
-    if host in ("0.0.0.0", "::", "*", ""):
-        host = "127.0.0.1"                 # bind-any -> reach it on loopback
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _raw_bind() -> tuple[str, int]:
+    """(host, port) exactly as stored -- 0.0.0.0 and friends kept, unlike
+    `listen_address()`, which maps them to the loopback address we dial."""
+    settings = _settings()
+    host = str(settings.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(settings.get("port", 8888))
+    except (TypeError, ValueError):
+        port = 8888
     if not 0 < port < 65536:
         port = max(1, min(port, 65535))
+    return host, port
+
+
+def bind_host() -> str:
+    """The interface the engine binds, exactly as configured.
+
+    Unlike `listen_address()` this keeps 0.0.0.0 / :: -- the "can a phone
+    reach this?" answer depends on the real bind, not on the loopback
+    address we dial it from.
+    """
+    return _raw_bind()[0]
+
+
+def listen_address() -> tuple[str, int]:
+    """(host, port) the engine is configured to bind on."""
+    host, port = _raw_bind()
+    if host in ("0.0.0.0", "::", "*", ""):
+        host = "127.0.0.1"                 # bind-any -> reach it on loopback
     return host, port
 
 
@@ -84,6 +173,107 @@ def proxy_url() -> str:
     if ":" in host:                        # literal IPv6 needs brackets
         host = f"[{host}]"
     return f"http://{host}:{port}"
+
+
+# the real lookup is polled by the panel roughly once a second, and a
+# machine's addresses do not change by the second -- so remember them for
+# a quarter of a minute (tests replace this function wholesale)
+REACHABLE_TTL = 15.0
+_reachable_cache: list[str] = []
+_reachable_at = 0.0
+
+
+def reachable_addresses() -> list[str]:
+    """Addresses another device on this network can reach us on.
+
+    The first entry is the address the routing table would send packets out
+    with -- a UDP `connect` only asks the table that question, no packet
+    ever leaves.  The rest come from a hostname lookup, which is how a
+    laptop is found on a phone hotspot that hands out no names.  Loopback
+    and link-local addresses are useless to anyone else, so they are left
+    out of the list rather than offered as a working address.
+    """
+    global _reachable_at
+    now = time.time()
+    if now - _reachable_at < REACHABLE_TTL:
+        return list(_reachable_cache)
+    found: list[str] = []
+
+    def add(value: str) -> None:
+        if not value or value in found:
+            return
+        if value.startswith(("127.", "169.254.", "::1", "fe80:")):
+            return
+        found.append(value)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("1.1.1.1", 80))       # route lookup, no packet
+            add(probe.getsockname()[0])
+    except OSError:
+        pass                                    # no route out at all
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                       socket.AF_INET, socket.SOCK_STREAM):
+            add(info[4][0])
+    except OSError:
+        pass
+    _reachable_cache[:] = found
+    _reachable_at = now
+    return found
+
+
+def _lan_note(address: str) -> str:
+    """What sort of network this address belongs to, for the phone hint."""
+    if address.startswith(("172.20.10.", "192.168.43.")):
+        return "phone hotspot"                 # iPhone / Android tethering
+    if address.startswith(("192.168.", "10.")):
+        return "local network"
+    if address.startswith("172."):
+        try:
+            inside = 16 <= int(address.split(".")[1]) <= 31
+        except (IndexError, ValueError):
+            inside = False
+        return "local network" if inside else "this machine"
+    return "this machine"
+
+
+def device_urls(host: str | None = None,
+                port: int | None = None) -> tuple[list[tuple[str, str]], str]:
+    """(`(url, note)` for every address a phone can dial, and a hint).
+
+    An empty list with a hint means the proxy only listens on this computer:
+    there is nothing to hand a phone, and saying so beats letting someone
+    type an address that could never work.  `host`/`port` default to the
+    bind stored in the state file; the panel passes the engine's *live*
+    bind instead, so a Settings change that has not been saved yet is
+    described the way it actually is.
+    """
+    if host is None or port is None:
+        raw_host, raw_port = _raw_bind()
+        host = raw_host if host is None else host
+        port = raw_port if port is None else port
+    host = str(host or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 8888
+    if not 0 < port < 65536:
+        port = max(1, min(port, 65535))
+
+    if host not in ("0.0.0.0", "::"):
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return [], ("this proxy only listens on this computer — set "
+                        "Listen host to 0.0.0.0 in Settings to reach it "
+                        "from a phone or another device")
+        return [(f"http://{host}:{port}", _lan_note(host))], ""
+
+    entries = [(f"http://{address}:{port}", _lan_note(address))
+               for address in reachable_addresses()]
+    if not entries:
+        return [], ("this machine has no address another device can reach "
+                    "(no network connection?)")
+    return entries, ""
 
 
 def exit_scope() -> str:
@@ -230,17 +420,99 @@ def _splice(path: Path, block: str | None) -> bool:
     return True
 
 
-def env_on() -> list[str]:
+# -- the Windows half of layer 1 -------------------------------------------
+def _win_set_var(name: str, value: str) -> bool:
+    """`setx` writes one variable into HKCU\\Environment (per user, no admin)."""
+    try:
+        proc = subprocess.run(["setx", name, value], capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[proxyctl] could not set {name}: {exc}")
+        return False
+    if proc.returncode:
+        print(f"[proxyctl] could not set {name}: "
+              f"{(proc.stderr or proc.stdout or '').strip()}")
+        return False
+    return True
+
+
+def _win_del_var(name: str) -> bool:
+    """`reg delete` removes it again; False when it was not set to begin with."""
+    try:
+        proc = subprocess.run(
+            ["reg", "delete", r"HKCU\Environment", "/v", name, "/f"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[proxyctl] could not unset {name}: {exc}")
+        return False
+    return proc.returncode == 0
+
+
+def _win_env_vars() -> dict[str, str]:
+    """The user's environment as stored in the registry, {} where unavailable."""
+    try:
+        import winreg
+    except ImportError:                     # not on Windows
+        return {}
+    values: dict[str, str] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            index = 0
+            while True:
+                try:
+                    name, value, _kind = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                values[str(name)] = str(value)
+                index += 1
+    except OSError:
+        return {}
+    return values
+
+
+def _win_env_on() -> list[str]:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     ENV_FILE.write_text(_env_script(), encoding="utf-8")
     OFF_FILE.write_text(_off_script(), encoding="utf-8")
     ENABLED.touch()
-    touched = [str(p) for p in RC_FILES if _splice(p, _block())]
+    wanted = {name: proxy_url() for name in PROXY_VARS}
+    wanted.update({name: NO_PROXY_VALUE for name in NO_PROXY_VARS})
+    current = _win_env_vars()               # so a second run really is a no-op
+    return [name for name, value in wanted.items()
+            if current.get(name) != value and _win_set_var(name, value)]
+
+
+def _win_env_off() -> list[str]:
+    ENABLED.unlink(missing_ok=True)
+    ENV_FILE.unlink(missing_ok=True)
+    OFF_FILE.unlink(missing_ok=True)
+    return [name for name in PROXY_VARS + NO_PROXY_VARS
+            if _win_del_var(name)]
+
+
+def _win_env_status() -> str:
+    if any(name in _win_env_vars() for name in PROXY_VARS):
+        return "on (new windows)"
+    if ENABLED.exists():
+        return "installed but switched off"
+    return "off"
+
+
+def env_on() -> list[str]:
+    if is_windows():
+        return _win_env_on()
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    ENV_FILE.write_text(_env_script(), encoding="utf-8")
+    OFF_FILE.write_text(_off_script(), encoding="utf-8")
+    ENABLED.touch()
+    touched = [str(p) for p in rc_files() if _splice(p, _block())]
     return touched
 
 
 def env_off() -> list[str]:
-    touched = [str(p) for p in RC_FILES if _splice(p, None)]
+    if is_windows():
+        return _win_env_off()
+    touched = [str(p) for p in rc_files() if _splice(p, None)]
     ENABLED.unlink(missing_ok=True)
     ENV_FILE.unlink(missing_ok=True)
     OFF_FILE.unlink(missing_ok=True)
@@ -248,9 +520,11 @@ def env_off() -> list[str]:
 
 
 def env_status() -> str:
+    if is_windows():
+        return _win_env_status()
     if ENABLED.exists():
         return "on (new logins)"
-    for p in RC_FILES:
+    for p in rc_files():
         try:
             if MARK_START in p.read_text(encoding="utf-8"):
                 return "installed but switched off"
@@ -264,7 +538,7 @@ def env_status() -> str:
 # ---------------------------------------------------------------------------
 def _firefox_profiles() -> list[Path]:
     """Every Firefox profile directory, in profiles.ini order."""
-    base = FF_BASE
+    base = firefox_base()
     ini = base / "profiles.ini"
     if not ini.exists():
         return []
@@ -402,8 +676,299 @@ def firefox_status() -> str:
 
 
 # ---------------------------------------------------------------------------
-# layer 3: Chromium / Brave launcher
+# layer 3: the system proxy (Windows / macOS) or the launchers (Linux)
 # ---------------------------------------------------------------------------
+def browsers_on() -> list[str]:
+    """Point *every* app on this machine at the proxy, or say why we cannot.
+
+    Windows and macOS keep one switch the whole system follows (WinINET /
+    `networksetup`), so on those platforms there is no launcher to copy --
+    writing .desktop files there would do nothing at all.
+    """
+    if is_windows():
+        return _win_system_on()
+    if is_macos():
+        return _mac_system_on()
+    return _launchers_on()
+
+
+def browsers_off() -> list[str]:
+    if is_windows():
+        return _win_system_off()
+    if is_macos():
+        return _mac_system_off()
+    return _launchers_off()
+
+
+def browsers_status() -> str:
+    if is_windows():
+        return _win_system_status()
+    if is_macos():
+        return _mac_system_status()
+    return _launchers_status()
+
+
+# -- Windows: the WinINET values Edge, Chrome and WinHTTP apps follow ------
+INET_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+INET_NAMES = ("ProxyEnable", "ProxyServer", "ProxyOverride")
+
+
+def _win_inet_set(name: str, value, kind: str = "sz") -> bool:
+    """Write one WinINET value under this user's hive (no admin needed)."""
+    try:
+        import winreg
+    except ImportError:                     # not on Windows
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INET_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if kind == "dword":
+                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+            else:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
+        return True
+    except OSError as exc:
+        print(f"[proxyctl] could not write {name}: {exc}")
+        return False
+
+
+def _win_inet_get(name: str):
+    try:
+        import winreg
+    except ImportError:
+        raise KeyError(name)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INET_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except OSError:
+        raise KeyError(name)
+    return value
+
+
+def _win_inet_delete(name: str) -> bool:
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INET_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, name)
+        return True
+    except OSError:
+        return False                        # already absent: nothing to undo
+
+
+def _win_notify() -> None:
+    """Tell Windows the settings changed -- apps read them lazily."""
+    try:
+        import ctypes
+        wininet = ctypes.windll.wininet
+        wininet.InternetSetOptionW(0, 39, None, 0)      # settings changed
+        wininet.InternetSetOptionW(0, 37, None, 0)      # refresh connections
+    except (AttributeError, OSError, ValueError):
+        pass                                            # best effort only
+
+
+def _win_backup_file() -> Path:
+    return APP_DIR / "win-inet.json"
+
+
+def _win_save_backup() -> None:
+    """Remember the system proxy as it was -- once, before the first write."""
+    path = _win_backup_file()
+    if path.exists():
+        return
+    prior = {}
+    for name in INET_NAMES:
+        try:
+            prior[name] = _win_inet_get(name)
+        except KeyError:
+            prior[name] = None               # was absent -> removed again on off
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(prior, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[proxyctl] could not save the previous settings: {exc}")
+
+
+def _win_system_on() -> list[str]:
+    host, port = listen_address()
+    target = f"{host}:{port}"
+    wanted = {"ProxyServer": target,
+              "ProxyEnable": 1,
+              "ProxyOverride": f"{NO_PROXY_VALUE};<local>"}
+    labels = {"ProxyServer": f"system proxy -> {target}",
+              "ProxyEnable": "system proxy enabled",
+              "ProxyOverride": f"bypass list -> {NO_PROXY_VALUE}"}
+    current: dict = {}
+    for name in wanted:
+        try:
+            current[name] = _win_inet_get(name)
+        except KeyError:
+            current[name] = None
+    _win_save_backup()
+    touched = []
+    for name, value in wanted.items():
+        if current.get(name) == value:
+            continue                        # already in that state
+        kind = "dword" if name == "ProxyEnable" else "sz"
+        if _win_inet_set(name, value, kind):
+            touched.append(labels[name])
+    if touched:
+        _win_notify()
+    return touched
+
+
+def _win_system_off() -> list[str]:
+    path = _win_backup_file()
+    prior: dict = {}
+    if path.exists():
+        try:
+            prior = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prior = {}
+    touched = []
+    for name in INET_NAMES:
+        value = prior.get(name) if prior else None
+        if value is None:
+            if _win_inet_delete(name):       # nothing of ours to put back
+                touched.append(f"removed {name}")
+        else:
+            kind = "dword" if name == "ProxyEnable" else "sz"
+            if _win_inet_set(name, value, kind):
+                touched.append(f"restored {name}={value}")
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"[proxyctl] could not remove {path}: {exc}")
+    _win_notify()
+    return touched
+
+
+def _win_system_status() -> str:
+    try:
+        if not _win_inet_get("ProxyEnable"):
+            return "off"
+    except KeyError:
+        return "off"
+    try:
+        server = str(_win_inet_get("ProxyServer") or "").strip()
+    except KeyError:
+        server = ""
+    return f"on ({server})" if server else "on (system)"
+
+
+# -- macOS: `networksetup`, which speaks per network service ---------------
+def _mac_run(args: list[str]) -> bool:
+    """Run `networksetup <args>`; False when it refuses (stubbed in tests)."""
+    try:
+        proc = subprocess.run(["networksetup", *args], capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[proxyctl] networksetup {args[0]}: {exc}")
+        return False
+    if proc.returncode:
+        print(f"[proxyctl] networksetup {args[0]}: "
+              f"{(proc.stderr or proc.stdout or '').strip()}")
+        return False
+    return True
+
+
+def _mac_capture(args: list[str]) -> str:
+    try:
+        proc = subprocess.run(["networksetup", *args], capture_output=True,
+                              text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _mac_service() -> str:
+    """The service carrying the default route (usually Wi-Fi).
+
+    macOS settings belong to a *service*, not to the machine, so pointing a
+    service the user is not on would look like it worked while doing
+    nothing for the network they are actually using.
+    """
+    interface = ""
+    try:
+        proc = subprocess.run(["route", "-n", "get", "default"],
+                              capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line.strip().startswith("interface:"):
+                    interface = line.split(":", 1)[1].strip()
+                    break
+    except (OSError, subprocess.SubprocessError):
+        pass
+    lines = _mac_capture(["-listnetworkserviceorder"]).splitlines()
+    first = ""
+    for index, line in enumerate(lines):
+        match = re.match(r"\s*\(\d+\)\s+(.+)", line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        first = first or name
+        if interface and index + 1 < len(lines) and \
+                f"Device: {interface}" in lines[index + 1]:
+            return name
+    return first                            # no route info -> first service
+
+
+def _mac_system_on() -> list[str]:
+    service = _mac_service()
+    if not service:
+        print("[proxyctl] no active network service to point at the proxy")
+        return []
+    host, port = listen_address()
+    target = f"{host}:{port}"
+    bypass = [d.strip() for d in NO_PROXY_VALUE.split(",") if d.strip()]
+    commands = [
+        ("http proxy", ["-setwebproxy", service, host, str(port)], target),
+        ("https proxy", ["-setsecurewebproxy", service, host, str(port)],
+         target),
+        ("socks proxy", ["-setsocksfirewallproxy", service, host, str(port)],
+         target),
+        ("bypass list", ["-setproxybypassdomains", service, *bypass],
+         NO_PROXY_VALUE),
+    ]
+    return [f"{name} -> {value}" for name, args, value in commands
+            if _mac_run(args)]
+
+
+def _mac_system_off() -> list[str]:
+    service = _mac_service()
+    if not service:
+        return []
+    commands = (("http proxy", ["-setwebproxystate", service, "off"]),
+                ("https proxy", ["-setsecurewebproxystate", service, "off"]),
+                ("socks proxy",
+                 ["-setsocksfirewallproxystate", service, "off"]))
+    return [f"{name} switched off" for name, args in commands
+            if _mac_run(args)]
+
+
+def _mac_system_status() -> str:
+    service = _mac_service()
+    if not service:
+        return "off"
+    out = _mac_capture(["-getwebproxy", service])
+    enabled, server, port = False, "", ""
+    for line in out.splitlines():
+        if line.startswith("Enabled:"):
+            enabled = "Yes" in line
+        elif line.startswith("Server:"):
+            server = line.split(":", 1)[1].strip()
+        elif line.startswith("Port:"):
+            port = line.split(":", 1)[1].strip()
+    if not enabled:
+        return "off"
+    return f"on ({server}:{port})" if server else "on (system)"
+
+
+# -- Linux: a per-browser .desktop launcher that passes --proxy-server ------
 def _exec_with_proxy(exec_line: str) -> str:
     url = proxy_url()
     if "--proxy-server" in exec_line:
@@ -419,7 +984,7 @@ def _exec_with_proxy(exec_line: str) -> str:
     return " ".join(parts + [flag])
 
 
-def browsers_on() -> list[str]:
+def _launchers_on() -> list[str]:
     DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
     touched = []
     for label, candidates in BROWSERS:
@@ -456,7 +1021,7 @@ def browsers_on() -> list[str]:
     return touched
 
 
-def browsers_off() -> list[str]:
+def _launchers_off() -> list[str]:
     touched = []
     for path in DESKTOP_DIR.glob("*-rotating-proxy.desktop"):
         try:
@@ -484,7 +1049,7 @@ def _chmod_x(path: Path) -> None:
         pass
 
 
-def browsers_status() -> str:
+def _launchers_status() -> str:
     found = sorted(p.name for p in DESKTOP_DIR.glob("*-rotating-proxy.desktop"))
     if not found:
         return "off"
@@ -499,6 +1064,79 @@ def browsers_status() -> str:
 # ---------------------------------------------------------------------------
 # everything
 # ---------------------------------------------------------------------------
+def layers() -> tuple[tuple[str, str, str], ...]:
+    """(key, title, blurb) for each layer, in *this* platform's own words.
+
+    The panel used to ship the Kali wording to every build, so a Windows
+    install told people to edit ~/.xsessionrc and look for Thunar menu
+    entries -- instructions that mean nothing on that machine, which is
+    exactly how "it still showed Kali apps" came about.
+    """
+    if is_windows():
+        return (
+            ("env", "Terminal & apps",
+             "Sets http_proxy and friends for your Windows user, so new "
+             "cmd, PowerShell, Python and curl windows use the proxy."),
+            ("firefox", "Firefox",
+             "Writes the proxy into every Firefox profile under %APPDATA%"
+             "\\Mozilla\\Firefox. Restart Firefox to pick it up; running "
+             "./proxyctl firefox off reverts it."),
+            ("browsers", "Edge / Chrome (system proxy)",
+             "Turns on the Windows system proxy those browsers follow, "
+             "and puts back whatever was set before."),
+        )
+    if is_macos():
+        return (
+            ("env", "Terminal & apps",
+             "Adds the proxy to ~/.zshrc and ~/.bashrc, so new terminal "
+             "and GUI sessions inherit http_proxy."),
+            ("firefox", "Firefox",
+             "Writes the proxy into every Firefox profile under "
+             "~/Library/Application Support/Firefox. Restart Firefox to "
+             "pick it up; ./proxyctl firefox off reverts it."),
+            ("browsers", "Safari / Chrome (system proxy)",
+             "Points the network service you are using at the proxy with "
+             "`networksetup`; turning it off switches that back."),
+        )
+    return (                                # Linux, Kali, *BSD
+        ("env", "Terminal & system apps",
+         "curl, wget, Python and other GIO/GTK apps (Thunar, file "
+         "managers, …) follow http_proxy. New logins inherit it from "
+         "~/.profile and ~/.xsessionrc."),
+        ("firefox", "Firefox",
+         "Writes the proxy into every Firefox profile's user.js. Restart "
+         "Firefox to pick it up; running ./proxyctl firefox off reverts "
+         "it."),
+        ("browsers", "Brave / Chromium",
+         "Adds a '<browser> (via rotating proxy)' launcher to your menu "
+         "that starts the browser with --proxy-server, plus its New "
+         "Window and Incognito actions."),
+    )
+
+
+def _layer_title(key: str) -> str:
+    for name, title, _blurb in layers():
+        if name == key:
+            return title
+    return key
+
+
+def _apply(key: str, want: bool) -> list[str]:
+    """Run one layer's on/off function by name."""
+    fns = {"env": (env_on, env_off),
+           "firefox": (firefox_on, firefox_off),
+           "browsers": (browsers_on, browsers_off)}
+    on_fn, off_fn = fns[key]
+    return on_fn() if want else off_fn()
+
+
+def _status_of(key: str) -> str:
+    fns = {"env": env_status,
+           "firefox": firefox_status,
+           "browsers": browsers_status}
+    return fns[key]()
+
+
 def _report(name: str, touched, what: str, state: str = "on") -> None:
     if touched:
         print(f"  {name:<12} {state:<5} <- {what}")
@@ -511,14 +1149,47 @@ def _report(name: str, touched, what: str, state: str = "on") -> None:
 def on() -> None:
     url = proxy_url()
     print(f"Pointing apps at {url}\n")
-    _report("environment", env_on(), "shell / terminal / GIO apps", "on")
-    _report("firefox", firefox_on(), "user.js", "on")
-    _report("browsers", browsers_on(), "desktop launcher", "on")
+    for key, _title, _blurb in layers():
+        _report(key, _apply(key, True), _layer_title(key), "on")
     if not is_listening():
         print(f"\n  ! nothing is answering on {url} yet.  Start the proxy first\n"
               "    (python3 run.py), otherwise everything you just pointed at\n"
               "    it will have no internet.\n")
-    print(f"""
+    entries, hint = device_urls()
+    if entries:
+        print("From a phone or another device on the same network:")
+        for address, note in entries:
+            suffix = f"   ({note})" if note else ""
+            print(f"    {address}{suffix}")
+        print("Set it as a manual HTTP proxy on the device, same port.\n")
+    elif hint:
+        print(f"  · other devices cannot reach this proxy yet: {hint}\n")
+    if is_windows():
+        print(f"""
+The environment layer applies to new command windows; the one you are in
+now still has the old values, so open a fresh window -- or run this to
+point the current one too:
+
+    set http_proxy={url}
+    set https_proxy={url}
+    set all_proxy={url}
+
+Firefox needs a restart. Edge and Chrome follow the system proxy you just
+turned on; running `./proxyctl off` puts back whatever was set before it.
+""")
+    elif is_macos():
+        print(f"""
+The environment layer only applies to *new* sessions. For the shell you are
+in right now, run:
+
+    . {home_hint(ENV_FILE)}
+
+Firefox needs a restart. Safari, Chrome and every other app follow the
+network-service proxy you just turned on; `./proxyctl off` restores the
+previous settings.
+""")
+    else:
+        print(f"""
 The environment layer only applies to *new* sessions. For the shell you are
 in right now, run:
 
@@ -533,10 +1204,19 @@ Firefox needs a restart. Brave/Chromium appear in your menu as
 
 def off() -> None:
     print("Taking apps off the proxy\n")
-    _report("environment", env_off(), "rc files", "off")
-    _report("firefox", firefox_off(), "user.js", "off")
-    _report("browsers", browsers_off(), "desktop launcher", "off")
-    print("""
+    for key, _title, _blurb in layers():
+        _report(key, _apply(key, False), _layer_title(key), "off")
+    if is_windows():
+        print("""
+This command window still carries the old values; open a new one and they
+are gone.  To clear this window too:
+
+    set http_proxy=
+    set https_proxy=
+    set all_proxy=
+""")
+    else:
+        print("""
 For the shell you are in right now, run:
 
     unset http_proxy https_proxy all_proxy ftp_proxy \\
@@ -553,9 +1233,15 @@ def status() -> int:
     if listening:
         print(f"answering  {'yes' if works() else 'no -- health check may '
                                              'still be running'}")
-    print(f"env        {env_status()}")
-    print(f"firefox    {firefox_status()}")
-    print(f"browsers   {browsers_status()}")
+    for key, _title, _blurb in layers():
+        print(f"{key:<10} {_status_of(key)}")
+    entries, hint = device_urls()
+    if entries:
+        for address, note in entries:
+            suffix = f"   ({note})" if note else ""
+            print(f"phone      {address}{suffix}")
+    elif hint:
+        print(f"phone      not reachable -- {hint}")
     print(f"no_proxy   {NO_PROXY_VALUE}")
     return 0 if listening else 1
 
@@ -595,12 +1281,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"usage: proxyctl {layer} on|off")
             return 2
         want_on = args[1].lower() == "on"
-        table = {"env": (env_on, env_off),
-                 "firefox": (firefox_on, firefox_off),
-                 "browsers": (browsers_on, browsers_off)}
-        on_fn, off_fn = table[layer]
-        touched = on_fn() if want_on else off_fn()
-        _report(layer, touched, layer, "on" if want_on else "off")
+        touched = _apply(layer, want_on)
+        _report(layer, touched, _layer_title(layer),
+                "on" if want_on else "off")
         if layer == "env":
             if want_on:
                 print(f"\n  . {home_hint(ENV_FILE)}          # current shell")

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from test_engine import start_mock, start_target, _free_port
 
+import proxyctl
 import gui
 from gui import ProxyGUI
 
@@ -46,6 +47,24 @@ def wait_until(predicate, app, timeout=12.0, ticks=8):
         if predicate():
             return True
     return False
+
+
+def widget_texts(widget):
+    """Every label/button text under `widget`, depth-first.
+
+    Dialog copy lives in real Tk widgets, so this is how the tests read what
+    a human would see instead of poking at internals.
+    """
+    out = []
+    for child in widget.winfo_children():
+        try:
+            text = str(child.cget("text"))
+        except Exception:                      # frames have no text option
+            text = ""
+        if text and text != "None":
+            out.append(text)
+        out.extend(widget_texts(child))
+    return out
 
 
 def http_get(port, host, path, timeout=8):
@@ -81,6 +100,20 @@ def test_construction():
           app.pill.cget("text"))
     check("start enabled", str(app.btn_start["state"]) == "normal")
     check("stop disabled", str(app.btn_stop["state"]) == "disabled")
+
+    # bound to every interface, the address shown must still be one a
+    # phone or another device can actually dial
+    app.engine.configure(host="0.0.0.0")
+    app._refresh_stats()
+    check("bind-any endpoint stays dialable",
+          app.endpoint_var.get().startswith("http://127.0.0.1:"),
+          app.endpoint_var.get())
+    check("nobody is told to dial 0.0.0.0",
+          "http://0.0.0.0" not in app.endpoint_var.get()
+          and "http://0.0.0.0" not in app.hint_var.get(),
+          f"{app.endpoint_var.get()} · {app.hint_var.get()}")
+    app.engine.configure(host=gui.DEFAULTS["host"])
+    app._refresh_stats()
     return app
 
 
@@ -601,8 +634,46 @@ def test_every_button(app):
         body = app.apps_win.winfo_children()[0]
         check("apps dialog built", len(body.winfo_children()) >= 5,
               str(len(body.winfo_children())))
+
+        # ---- what the dialog actually says -------------------------------
+        texts = widget_texts(app.apps_win)
+        joined = " ".join(texts)
+        titles = [title for _key, title, _blurb in proxyctl.layers()]
+        check("apps dialog titles come from the platform",
+              all(title in joined for title in titles), joined[:400])
+        check("apps dialog explains the phone block",
+              "FROM A PHONE OR ANOTHER DEVICE" in joined, joined[:400])
+        check("a loopback proxy is warned about instead of offered",
+              "Listen host" in joined and "0.0.0.0" in joined, joined[:400])
+        check("no address invented for the phone",
+              not any(text.startswith("http://") for text in texts
+                      if text != proxyctl.proxy_url()),
+              str(texts))
         app.apps_win.destroy()
         pump(app, ticks=2)
+
+        # the same dialog on Windows must offer Windows, not Kali
+        saved_platform = proxyctl.PLATFORM
+        proxyctl.PLATFORM = "win32"
+        try:
+            app._open_apps()
+            pump(app, ticks=2)
+            win_joined = " ".join(widget_texts(app.apps_win))
+            check("windows dialog describes windows apps",
+                  "PowerShell" in win_joined and "Edge / Chrome" in win_joined,
+                  win_joined[:400])
+            check("windows dialog drops the linux paths",
+                  "xsessionrc" not in win_joined and "Thunar" not in win_joined,
+                  win_joined[:400])
+            check("windows dialog keeps the phone block",
+                  "FROM A PHONE OR ANOTHER DEVICE" in win_joined,
+                  win_joined[:400])
+        finally:
+            proxyctl.PLATFORM = saved_platform
+            if app.apps_win is not None:
+                app.apps_win.destroy()
+                app.apps_win = None
+            pump(app, ticks=2)
         check("Quit left alone on purpose",
               "File/Quit" in wired and wired["File/Quit"])
 
