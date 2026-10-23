@@ -29,6 +29,11 @@ in front of it.
   throws the configured upstreams away and keeps only a fresh pull, so
   yesterday's proxies never pile up under today's — *Proxy → Rotate pool
   now* does it on the spot, and a pull that fails keeps the pool it had
+* **Every request is on record** — the panel's *Requests* tab says what
+  was served, not only how much: method, full target, which device asked,
+  which exit carried it, the status the target itself chose, bytes moved
+  and duration, for the last 500 requests (502s are kept too, so targets
+  nobody could reach stay visible)
 
 ```
 $ python3 run.py            # opens the desktop panel
@@ -646,6 +651,13 @@ full-width cards underneath.
   States (US) · strong fallback`, plus what verification found once you
   ask (`… · 412 verified · 4 geo≠ · 89 risky`).
 * **Log** — timestamped engine log with level filtering and colour.
+* **Requests** — every request the proxy answered, newest first: *Time*,
+  *Method*, *Request* (`host:port/path`), *Asked by* (which device dialed
+  in — matters once the listener is on `0.0.0.0`), *Exit* (which upstream
+  carried it), *Code* (the target's own status — amber at ≥ 400, red at
+  ≥ 500, `502` when no exit could reach it), *Moved* (bytes both ways) and
+  *Took*. Holds the last 500; **Clear** empties it without touching the
+  counters. Headless runs see the same detail with `--log-level debug`.
 * **Traffic** — rolling sparkline of requests and concurrent connections.
 * **Settings** — listen address, health-check interval, retries, timeouts,
   parallel probes, whether to also probe HTTPS tunnel support, the

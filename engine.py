@@ -40,6 +40,8 @@ via a queue).
 
 from __future__ import annotations
 
+from collections import deque
+
 import ipaddress
 import random
 import re
@@ -1196,6 +1198,12 @@ class RotatingProxy:
             "check_progress": (0, 0),
         }
 
+        # what the panel's Requests tab shows: one record per answered
+        # request, newest last, capped so the ring can never grow into the
+        # process -- 500 entries is minutes of a busy proxy, not a leak
+        self._requests: deque[dict] = deque(maxlen=500)
+        self._request_seq = 0
+
         if proxies is not None:
             self.set_proxies(proxies)
 
@@ -1772,6 +1780,38 @@ class RotatingProxy:
             self.stats["bytes_out"] += up
             self.stats["bytes_in"] += down
 
+    def _note_request(self, method: str, target: str, node: "Node | None",
+                      status: int, t0: float, up: int = 0, down: int = 0,
+                      client: str = "") -> None:
+        """Remember one answered request so the panel can show it.
+
+        Counters say *how many* requests were served; this says **what they
+        were for** -- method, target, which device asked, which exit
+        carried it and how it went.  Called when the exchange finishes, so
+        `ms` and the byte totals describe the whole relay.  A 502 is
+        recorded too (with no exit): "nobody could reach that" is exactly
+        what an operator needs to see.
+        """
+        with self._lock:
+            self._request_seq += 1
+            self._requests.append({
+                "seq": self._request_seq,
+                "t": time.time(),
+                "method": method,
+                "target": target,
+                "client": client,
+                "via": node.label if node is not None else "",
+                "status": int(status),
+                "ms": max(0, int((time.monotonic() - t0) * 1000)),
+                "up": int(up),
+                "down": int(down),
+            })
+
+    def clear_requests(self) -> None:
+        """Empty the request history (the counters keep their totals)."""
+        with self._lock:
+            self._requests.clear()
+
     # -- upstream selection ----------------------------------------------
     @staticmethod
     def _state_matches(node: "Node", want: str) -> bool:
@@ -1991,12 +2031,16 @@ class RotatingProxy:
                 self._reply(client, "400 Bad Request")
                 return
             method, target = parts[0].upper(), parts[1]
+            try:
+                peer = client.getpeername()[0]      # which device asked
+            except OSError:
+                peer = ""
 
             if method == "CONNECT":
                 host, port = _split_hostport(target, 443)
-                self._open_tunnel(client, host, port)
+                self._open_tunnel(client, host, port, peer)
             else:
-                self._relay_plain(client, head, method, target)
+                self._relay_plain(client, head, method, target, peer)
         except (socket.timeout, TimeoutError):
             pass
         except ValueError as exc:
@@ -2063,7 +2107,9 @@ class RotatingProxy:
             raise
 
     # -- CONNECT (HTTPS) --------------------------------------------------
-    def _open_tunnel(self, client: socket.socket, host: str, port: int) -> None:
+    def _open_tunnel(self, client: socket.socket, host: str, port: int,
+                     peer: str = "") -> None:
+        started = time.monotonic()
         for node in self._candidates(connect=True):
             try:
                 t0 = time.monotonic()
@@ -2080,18 +2126,23 @@ class RotatingProxy:
                 self.log("debug", f"tunnel {host}:{port} via {node.label}")
                 # `early` is any target data the upstream already buffered
                 # alongside its 200 -- it must not be dropped.
-                self._pipe(client, up, primed=early)
+                sent, got = self._pipe(client, up, primed=early)
+                self._note_request("CONNECT", f"{host}:{port}", node, 200,
+                                   started, sent, got, peer)
                 return
             except Exception as exc:
                 self._note_failure(node, str(exc)[:80] or "connect failed")
         self._bump("failed")
+        self._note_request("CONNECT", f"{host}:{port}", None, 502,
+                           started, 0, 0, peer)
         self._reply(client, "502 Bad Gateway")
         self.log("error", f"no upstream could reach {host}:{port}"
                           f"{self._no_upstream_note()}")
 
     # -- plain HTTP -------------------------------------------------------
     def _relay_plain(self, client: socket.socket, head: bytes,
-                     method: str, target: str) -> None:
+                     method: str, target: str, peer: str = "") -> None:
+        started = time.monotonic()
         host, port, path = self._origin_of(head, method, target)
         if not host:
             self._reply(client, "400 Bad Request")
@@ -2182,7 +2233,14 @@ class RotatingProxy:
                 self.log("debug", f"{method} {host}:{port}{path} via {node.label}")
                 # BUG FIX: relay the real response (and any follow-up
                 # traffic) instead of assuming GET succeeded.
-                self._pipe(client, up, primed=first)
+                # The request head and body never cross `_pipe` (they were
+                # forwarded straight to the upstream), so add them to what
+                # the pipe saw before putting a size on the record.
+                request_bytes = len(out_head) + int(sent or 0)
+                piped_up, piped_down = self._pipe(client, up, primed=first)
+                self._note_request(method, f"{host}:{port}{path}", node, code,
+                                   started, request_bytes + piped_up,
+                                   piped_down, peer)
                 return
             except Exception as exc:
                 if up is not None:
@@ -2192,6 +2250,8 @@ class RotatingProxy:
                         pass
                 self._note_failure(node, str(exc)[:80] or "relay failed")
         self._bump("failed")
+        self._note_request(method, f"{host}:{port}{path}", None, 502,
+                           started, 0, 0, peer)
         self._reply(client, "502 Bad Gateway")
         self.log("error", f"no upstream could reach {host}:{port}{path}"
                           f"{self._no_upstream_note()}")
@@ -2295,19 +2355,23 @@ class RotatingProxy:
 
     # -- relay ------------------------------------------------------------
     def _pipe(self, a: socket.socket, b: socket.socket,
-              primed: bytes = b"") -> None:
+              primed: bytes = b"") -> tuple[int, int]:
         """Bidirectional relay until either side closes, idle timeout, or stop.
 
         `primed` is a chunk already read from `b` (the upstream); it is
         delivered to `a` (the client) first so nothing observed while we were
-        still deciding whether to trust this upstream gets lost.
+        still deciding whether to trust this upstream gets lost.  Returns
+        `(up, down)` -- the bytes each way, so a caller can put a real size
+        on the request it just served.
         """
         idle = float(self.settings["idle_timeout"])
         last = time.monotonic()
+        up = down = 0
         try:
             if primed:
                 a.sendall(primed)
                 self._bytes(up=0, down=len(primed))
+                down += len(primed)
                 last = time.monotonic()
             while not self._stop.is_set():
                 ready, _, _ = select.select([a, b], [], [], 1.0)
@@ -2320,13 +2384,15 @@ class RotatingProxy:
                     other = b if s is a else a
                     data = s.recv(RELAY_CHUNK)
                     if not data:
-                        return
+                        return up, down
                     last = time.monotonic()
                     other.sendall(data)
                     if s is a:
                         self._bytes(up=len(data), down=0)
+                        up += len(data)
                     else:
                         self._bytes(up=0, down=len(data))
+                        down += len(data)
         except (OSError, socket.timeout):
             pass
         finally:
@@ -2339,6 +2405,7 @@ class RotatingProxy:
                     s.close()
                 except OSError:
                     pass
+        return up, down
 
     # -- health checks ----------------------------------------------------
     def probe(self, node: Node) -> tuple[bool, float | None, str, bool | None]:
@@ -3109,6 +3176,7 @@ class RotatingProxy:
                 verified=sum(1 for n in self._nodes if n.verified),
                 mismatch=sum(1 for n in self._nodes if n.mismatch),
                 risk=sum(1 for n in self._nodes if n.risk),
+                requests=list(self._requests),   # oldest first, <= 500
                 host=self.host,
                 port=self.port,
                 checking=self._checking.is_set(),

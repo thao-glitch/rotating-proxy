@@ -2086,6 +2086,95 @@ def test_regeolocate():
         geodb.available = real_avail
 
 
+def test_request_log(target_port, mock_port, dead_port):
+    """The served-request history: what each request was *for*.
+
+    The counters only say *how many* requests were served; the Requests
+    tab needs method, target, which device asked, which exit carried it,
+    the status the target itself chose and how much moved -- including a
+    502, because "nobody could reach that" is exactly what an operator
+    scrolls a request log to find.
+    """
+    print("\nserved-request history")
+    import time
+
+    def wait_for(engine, count, tries=60):
+        """The record lands right after the relay shuts down; give it a beat."""
+        for _ in range(tries):
+            reqs = engine.snapshot()["requests"]
+            if len(reqs) >= count:
+                return reqs
+            time.sleep(0.05)
+        return engine.snapshot()["requests"]
+
+    eng = RotatingProxy(logger=quiet, proxies=[f"127.0.0.1:{mock_port}"])
+    free = _free_port()
+    eng.configure(port=free)
+    eng.start(probe_first=False)
+    try:
+        http_get(free, f"127.0.0.1:{target_port}", "/hello")
+        reqs = wait_for(eng, 1)
+        check("one record after one GET", len(reqs) == 1, str(len(reqs)))
+        rec = reqs[-1]
+        check("method recorded", rec["method"] == "GET", str(rec["method"]))
+        check("target recorded",
+              rec["target"] == f"127.0.0.1:{target_port}/hello",
+              rec["target"])
+        check("the exit that carried it recorded",
+              rec["via"] == f"127.0.0.1:{mock_port}", rec["via"])
+        check("the target's own status kept",
+              rec["status"] == 200, str(rec["status"]))
+        check("the asking device recorded",
+              rec["client"] == "127.0.0.1", rec["client"])
+        check("bytes moved counted",
+              rec["up"] > 0 and rec["down"] > 0,
+              str((rec["up"], rec["down"])))
+        check("timing recorded", rec["ms"] >= 0 and rec["t"] > 0,
+              str(rec["ms"]))
+        check("sequence numbers grow", rec["seq"] >= 1, str(rec["seq"]))
+
+        # a tunnel: the destination is what the request was for
+        inner = (f"GET /tun HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\n"
+                 f"Connection: close\r\n\r\n").encode()
+        http_connect(free, f"127.0.0.1:{target_port}", inner)
+        reqs = wait_for(eng, 2)
+        conn = reqs[-1]
+        check("tunnel recorded as CONNECT to its destination",
+              len(reqs) == 2 and conn["method"] == "CONNECT"
+              and conn["target"] == f"127.0.0.1:{target_port}", str(conn))
+
+        # the ring is capped, and Clear empties it without touching totals
+        for i in range(505):
+            eng._note_request("GET", f"/probe/{i}", None, 200,
+                              time.monotonic())
+        reqs = eng.snapshot()["requests"]
+        check("history is capped", len(reqs) == 500, str(len(reqs)))
+        check("newest kept, oldest dropped",
+              reqs[-1]["target"] == "/probe/504", reqs[-1]["target"])
+        eng.clear_requests()
+        check("clear empties the history",
+              eng.snapshot()["requests"] == [], "")
+        check("counters untouched by clear",
+              eng.snapshot()["served"] == 2, str(eng.snapshot()["served"]))
+    finally:
+        eng.stop()
+
+    # a request nobody could carry is recorded too: 502, no exit
+    dead = RotatingProxy(logger=quiet, proxies=[f"127.0.0.1:{dead_port}"])
+    free2 = _free_port()
+    dead.configure(port=free2)
+    dead.start(probe_first=False)
+    try:
+        http_get(free2, f"127.0.0.1:{target_port}", "/nowhere")
+        reqs = wait_for(dead, 1)
+        rec = reqs[-1] if reqs else {}
+        check("failed request recorded as 502 with no exit",
+              len(reqs) == 1 and rec.get("status") == 502
+              and rec.get("via") == "", str(rec))
+    finally:
+        dead.stop()
+
+
 def test_daily_rotation():
     """The daily rotation: a fresh pull replaces the whole pool, and a
     failed pull never empties it.
@@ -2499,6 +2588,7 @@ def main():
         test_list_refresh,
         test_geo_country_fallback,
         test_regeolocate,
+        lambda: test_request_log(target_port, mock_port, dead_port),
         test_daily_rotation,
         lambda: test_pool_restock(mock_port, dead_port),
         test_lifecycle,

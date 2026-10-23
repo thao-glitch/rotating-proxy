@@ -215,6 +215,7 @@ class ProxyGUI(tk.Tk):
         self._https_var = tk.BooleanVar(value=False)
         self._level_var = tk.StringVar(value="Info & up")
         self._auto_scroll = tk.BooleanVar(value=True)
+        self._req_seen = 0                      # last request seq rendered
         self._closing = False
 
         _init_fonts(self)
@@ -596,6 +597,50 @@ class ProxyGUI(tk.Tk):
         lsb.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
 
+        req_tab = ttk.Frame(self.notebook, style="Panel.TFrame")
+        self.notebook.add(req_tab, text="  Requests  ")
+
+        rbar = SectionBar(req_tab)
+        rbar.pack(fill="x")
+        tk.Label(rbar, text="REQUESTS SERVED", bg=PANEL_2, fg=MUTED,
+                 font=F["heading"]).pack(side="left")
+        self.req_count = tk.Label(rbar, text="", bg=PANEL_2, fg=MUTED,
+                                  anchor="e")
+        self.req_count.pack(side="right", padx=(10, 0))
+        ttk.Button(rbar, text="Clear", style="Ghost.TButton",
+                   command=self._clear_requests, width=7).pack(side="right",
+                                                               padx=4)
+
+        body3 = tk.Frame(req_tab, bg=PANEL)
+        body3.pack(fill="both", expand=True)
+        rcols = ("t", "method", "target", "client", "via", "status",
+                 "size", "ms")
+        # widths sum to 684px, measured like the pool table's 682: the
+        # request and exit columns stretch to fill whatever is left
+        rheads = {"t": ("Time", 70, "center"),
+                  "method": ("Method", 64, "center"),
+                  "target": ("Request", 176, "w"),
+                  "client": ("Asked by", 96, "w"),
+                  "via": ("Exit", 118, "w"),
+                  "status": ("Code", 50, "center"),
+                  "size": ("Moved", 62, "e"),
+                  "ms": ("Took", 48, "e")}
+        self.req_tree = ttk.Treeview(body3, columns=rcols, show="headings",
+                                     selectmode="extended")
+        for col, (title, width, anchor) in rheads.items():
+            self.req_tree.heading(col, text=title)
+            self.req_tree.column(col, width=width, anchor=anchor,
+                                 minwidth=40,
+                                 stretch=(col in ("target", "via")))
+        for tag, colour in (("r_ok", TEXT), ("r_warn", AMBER),
+                            ("r_bad", RED)):
+            self.req_tree.tag_configure(tag, foreground=colour)
+        rsb = ttk.Scrollbar(body3, orient="vertical",
+                            command=self.req_tree.yview)
+        self.req_tree.configure(yscrollcommand=rsb.set)
+        self.req_tree.pack(side="left", fill="both", expand=True)
+        rsb.pack(side="right", fill="y")
+
         graph_tab = ttk.Frame(self.notebook, style="Panel.TFrame")
         self.notebook.add(graph_tab, text="  Traffic  ")
         self.graph = tk.Canvas(graph_tab, bg=PANEL, highlightthickness=0)
@@ -728,6 +773,7 @@ class ProxyGUI(tk.Tk):
             self._drain_queue()
             self._refresh_stats()
             self._render_pool()
+            self._render_requests()
             self._draw_graph()
         except tk.TclError:
             return
@@ -1456,6 +1502,51 @@ class ProxyGUI(tk.Tk):
         text.configure(state="disabled")
         if self._auto_scroll.get():
             text.see("end")
+
+    # ------------------------------------------------------ requests tab
+    @staticmethod
+    def _fmt_size(total: int) -> str:
+        if total >= 1_048_576:
+            return f"{total / 1_048_576:.1f} MB"
+        if total >= 1024:
+            return f"{total / 1024:.1f} KB"
+        return f"{total} B"
+
+    def _render_requests(self):
+        """Add the engine's new request records, newest at the top.
+
+        The engine owns the ring (and its cap); the table only ever
+        inserts rows it has not shown, because polling must not rebuild a
+        500-row list six times a second.  A code >= 400 is amber, >= 500
+        red -- the same trouble colours the pool table uses.
+        """
+        reqs = self.engine.snapshot().get("requests") or []
+        fresh = [r for r in reqs if r["seq"] > self._req_seen]
+        if not fresh:
+            return
+        self._req_seen = fresh[-1]["seq"]
+        for r in fresh:                      # oldest first -> newest on top
+            code = int(r.get("status") or 0)
+            tag = ("r_bad" if code >= 500 else
+                   "r_warn" if code >= 400 else "r_ok")
+            self.req_tree.insert("", 0, values=(
+                time.strftime("%H:%M:%S", time.localtime(r["t"])),
+                r["method"], r["target"], r.get("client") or "",
+                r.get("via") or "—", code,
+                self._fmt_size(int(r.get("up") or 0)
+                               + int(r.get("down") or 0)),
+                r.get("ms", 0)), tags=(tag,))
+        rows = self.req_tree.get_children()
+        if len(rows) > 500:
+            self.req_tree.delete(*rows[500:])
+        self.req_count.configure(
+            text=f"{len(self.req_tree.get_children())} recent")
+
+    def _clear_requests(self):
+        self.engine.clear_requests()
+        self.req_tree.delete(*self.req_tree.get_children())
+        self.req_count.configure(text="")
+        self.status_var.set("Request history cleared")
 
     def _clear_log(self):
         self._log_lines.clear()

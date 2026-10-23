@@ -92,7 +92,8 @@ def test_construction():
     check("stat cards built", len(app.cards) == 6, str(list(app.cards)))
     check("pool table built", app.tree.winfo_exists())
     check("log widget built", app.log_text.winfo_exists())
-    check("notebook tabs", app.notebook.index("end") == 2,
+    check("requests table built", app.req_tree.winfo_exists())
+    check("notebook tabs", app.notebook.index("end") == 3,
           str(app.notebook.tabs()))
     check("endpoint hint shown", "127.0.0.1:8888" in app.endpoint_var.get(),
           app.endpoint_var.get())
@@ -703,10 +704,39 @@ def test_every_button(app):
         app._auto_scroll.set(True)
 
         # ---- notebook + graph -------------------------------------------
-        app.notebook.select(1)
+        app.notebook.select(2)                     # Traffic is the third tab
         pump(app, ticks=3)
         check("traffic tab draws",
               len(app.graph.find_all()) > 0, str(app.graph.find_all()[:4]))
+
+        # ---- requests tab ------------------------------------------------
+        app.notebook.select(1)
+        app.engine._note_request("GET", "example.com:80/x", None, 200,
+                                 time.monotonic(), 120, 3400, "127.0.0.1")
+        app._render_requests()
+        rows = app.req_tree.get_children()
+        check("requests table renders a record",
+              len(rows) == 1
+              and str(app.req_tree.set(rows[0], "target")) == "example.com:80/x",
+              str([app.req_tree.item(r)["values"] for r in rows]))
+        check("requests table names the asking device",
+              bool(rows) and str(app.req_tree.set(rows[0], "client"))
+              == "127.0.0.1",
+              str(app.req_tree.set(rows[0], "client") if rows else ""))
+        check("requests count label follows",
+              "1 recent" in app.req_count.cget("text"),
+              app.req_count.cget("text"))
+        pump(app, ticks=2)
+        check("polling never duplicates a row",
+              len(app.req_tree.get_children()) == 1,
+              str(len(app.req_tree.get_children())))
+        app._clear_requests()
+        check("requests table clears",
+              not app.req_tree.get_children(),
+              str(app.req_tree.get_children()))
+        check("clearing the history empties the engine ring",
+              app.engine.snapshot()["requests"] == [],
+              str(app.engine.snapshot()["requests"]))
         app.notebook.select(0)
         pump(app, ticks=2)
 
