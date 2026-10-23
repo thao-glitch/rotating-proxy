@@ -1668,7 +1668,11 @@ class ProxyGUI(tk.Tk):
             return
         self._append_log(time.time(), "info", f"state database installed: "
                                               f"{path}")
-        self.status_var.set("State/city database installed.")
+        resolved = self.engine.regeolocate()
+        self.status_var.set(
+            "State/city database installed."
+            + (f" Locations resolved for {resolved} upstreams."
+               if resolved else ""))
         # the cascade can offer states now: re-offer every box from the top
         snap = self.engine.snapshot()
         self._refresh_regions(snap)

@@ -60,7 +60,8 @@ DB_PATHS = (
     "/var/lib/GeoIP/GeoIP.dat",
 )
 
-_INSTALL_HINT = "install `geoip-database python3-geoip` for country data"
+_INSTALL_HINT = "no country data -- download the state/city database in " \
+                "Settings (or install `geoip-database python3-geoip`)"
 
 # where the city (state-level) database lives and where else one might
 # already be installed -- our own download comes first
@@ -162,18 +163,28 @@ def _open():
 
 
 def available() -> bool:
-    """True when country data can actually be resolved."""
-    return _open() is not None
+    """True when country data can actually be resolved.
+
+    The system GeoIP database is one source, not *the* source: a packaged
+    build (Windows above all, which ships neither `python3-geoip` nor a
+    system database) answers country out of the downloaded city database
+    instead -- DB-IP's city records carry the country too.  One download
+    therefore serves every level of the picker.
+    """
+    return _open() is not None or _open_city() is not None
 
 
 def source() -> str:
     """A short human description of where country data comes from."""
-    if _open() is None:
-        return _INSTALL_HINT
-    for path in DB_PATHS:
-        if os.path.isfile(path):
-            return path
-    return "GeoIP"
+    legacy = _open()
+    if legacy is not None:
+        for path in DB_PATHS:
+            if os.path.isfile(path):
+                return path
+        return "GeoIP"
+    if _open_city() is not None:
+        return f"{city_path()} (state/city database)"
+    return _INSTALL_HINT
 
 
 def lookup(host: str) -> tuple[str, str]:
@@ -205,6 +216,17 @@ def lookup(host: str) -> tuple[str, str]:
                     name = _clean(db.country_name_by_addr(host))
         except Exception:
             code = name = ""
+    if not code:
+        # No system GeoIP -- the packaged-Windows case, and any machine
+        # without python3-geoip.  The downloaded city database carries the
+        # country as well, so the same one-time download that fills the
+        # State column fills Country, scope and every cascade.
+        record = _open_city().get(host) if _open_city() is not None else None
+        if isinstance(record, dict):
+            country = record.get("country")
+            if isinstance(country, dict):
+                code = _clean(country.get("iso_code"), upper=True)
+                name = _english(country)
     result = (code, name)
     _CACHE[host] = result
     return result

@@ -1263,6 +1263,32 @@ class RotatingProxy:
         """ISO code the pool is restricted to, or "" for anywhere."""
         return str(self.settings.get("country") or "").upper()
 
+    def regeolocate(self) -> int:
+        """Resolve country/state/city for the whole pool again.
+
+        The location databases can land *after* the pool was built -- a
+        fresh install downloads the city database seconds after start()
+        -- and every scope filter, table column and Settings cascade
+        reads these fields, so the answer has to be filled in the moment
+        the data shows up.  Returns how many upstreams changed.
+        """
+        changed = 0
+        with self._lock:
+            for n in self._nodes:
+                cc, name = resolve_country(n.host,
+                                           self._cc_hints.get(n.label, ""))
+                state_name, state_code, city = resolve_state(n.host)
+                if (cc, name, state_name, state_code, city) != (
+                        n.cc, n.country, n.state, n.state_code, n.city):
+                    changed += 1
+                n.cc, n.country = cc, name
+                n.state, n.state_code = state_name, state_code
+                n.city = city
+        if changed:
+            self.log("info", f"locations resolved for {changed} "
+                             f"upstream{'' if changed == 1 else 's'}")
+        return changed
+
     def set_country(self, value) -> str:
         """Restrict upstream selection to one country ("" = anywhere).
 
@@ -1287,6 +1313,11 @@ class RotatingProxy:
                 if not code:
                     raise ValueError(f"unknown country {value!r}")
                 if not any(n.cc == code for n in self._nodes):
+                    if not geodb.available():
+                        raise ValueError("location data is not installed "
+                                         "yet -- the download runs on "
+                                         "start and shows in Settings; "
+                                         "try again in a moment")
                     raise ValueError(f"no upstreams configured for {code}")
                 region = str(self.settings.get("region") or "")
                 if region and region_of(code) != region:
@@ -1646,6 +1677,46 @@ class RotatingProxy:
         self.start_health_loop()
         self.start_refresh_loop()
         self.start_rotation_loop()
+        self.start_geo_autofetch()
+
+    def start_geo_autofetch(self) -> None:
+        """Download the location databases once, if they are missing.
+
+        A fresh install -- especially on Windows, where neither
+        `python3-geoip` nor a system GeoIP database exists -- starts with
+        no country/city/ASN data at all: the scope pickers refuse every
+        country, the Country column stays empty and the risk flags never
+        fill.  Fetch both files once in the background instead of making
+        anyone find the Settings button first, then resolve the pool
+        against them.  Present already: no thread, no network.
+        """
+        if geodb.city_available() and geodb.asn_available():
+            return
+        threading.Thread(target=self._geo_autofetch, name="geo-autofetch",
+                         daemon=True).start()
+
+    def _geo_autofetch(self) -> None:
+        if not geodb.city_available():
+            self.log("info", "state/city database not installed -- "
+                             "downloading it (one time, ~120 MB)…")
+            try:
+                path = geodb.fetch_city_db()
+            except Exception as exc:                # noqa: BLE001
+                self.log("warn", "state/city database download failed: "
+                                 f"{str(exc)[:120]} -- retry from Settings")
+            else:
+                self.log("info", f"state/city database installed: {path}")
+                self.regeolocate()
+        if not geodb.asn_available():
+            self.log("info", "network (ASN) database not installed -- "
+                             "downloading it (one time, ~5 MB)…")
+            try:
+                path = geodb.fetch_asn_db()
+            except Exception as exc:                # noqa: BLE001
+                self.log("warn", "network database download failed: "
+                                 f"{str(exc)[:120]} -- retry with --asn-fetch")
+            else:
+                self.log("info", f"network (ASN) database installed: {path}")
 
     def stop(self) -> None:
         if not self.running and self.stats["status"] != "starting":

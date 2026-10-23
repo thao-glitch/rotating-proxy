@@ -1958,6 +1958,134 @@ def test_list_refresh():
         httpd.shutdown()
 
 
+def test_geo_country_fallback():
+    """Country must resolve without the system GeoIP binding.
+
+    On Windows -- and on any packaged build without python3-geoip --
+    there is no legacy GeoIP database at all.  If `lookup()` cannot answer
+    from the downloaded city database, every scope picker, the Country
+    column and the Settings cascades come up empty on exactly the
+    installs that cannot `apt install python3-geoip`.
+    """
+    print("\ncountry from the city database (no system GeoIP)")
+    import geodb
+
+    class FakeCity:
+        def get(self, ip):
+            if ip != "203.0.113.7":
+                return None
+            return {"country": {"iso_code": "DE",
+                                "names": {"en": "Germany"}},
+                    "subdivisions": [{"iso_code": "BE",
+                                      "names": {"en": "Berlin"}}],
+                    "city": {"names": {"en": "Berlin"}}}
+
+    class FakeLegacy:
+        def country_code_by_addr(self, _host):
+            return "FR"
+
+        def country_name_by_addr(self, _host):
+            return "France"
+
+        def country_code_by_addr_v6(self, _host):
+            return "FR"
+
+        def country_name_by_addr_v6(self, _host):
+            return "France"
+
+    saved_open, saved_city = geodb._open, geodb._open_city
+    saved_cache = dict(geodb._CACHE)
+    try:
+        # the Windows case: no system GeoIP, city database present
+        geodb._CACHE.clear()
+        geodb._open = lambda: None
+        geodb._open_city = lambda: FakeCity()
+        check("country data counts as available",
+              geodb.available() is True, str(geodb.available()))
+        check("source names the city database",
+              "city" in geodb.source(), geodb.source())
+        check("country resolved from the city record",
+              geodb.lookup("203.0.113.7") == ("DE", "Germany"),
+              str(geodb.lookup("203.0.113.7")))
+        check("an address the database does not know stays unknown",
+              geodb.lookup("198.51.100.9") == ("", ""),
+              str(geodb.lookup("198.51.100.9")))
+
+        # nothing installed at all: say so honestly
+        geodb._open_city = lambda: None
+        geodb._CACHE.clear()
+        check("no databases at all means unavailable",
+              geodb.available() is False, str(geodb.available()))
+
+        # with a system GeoIP present it still has the first word
+        geodb._open = lambda: FakeLegacy()
+        geodb._open_city = lambda: FakeCity()
+        geodb._CACHE.clear()
+        check("the system GeoIP answer still wins",
+              geodb.lookup("203.0.113.7") == ("FR", "France"),
+              str(geodb.lookup("203.0.113.7")))
+    finally:
+        geodb._open, geodb._open_city = saved_open, saved_city
+        geodb._CACHE.clear()
+        geodb._CACHE.update(saved_cache)
+
+
+def test_regeolocate():
+    """A location database that lands after the pool must still scope it.
+
+    First run on a machine with no GeoIP: the pool is built with empty
+    countries (so the picker refuses every choice), the city database
+    downloads a moment later, and -- without restarting anything --
+    `regeolocate()` has to fill the answers in so Region/Country/State
+    start working.
+    """
+    print("\nre-resolving locations when the database arrives")
+    import engine as eng_mod
+    import geodb
+
+    real_c, real_s = eng_mod.resolve_country, eng_mod.resolve_state
+    real_avail = geodb.available
+    try:
+        geodb.available = lambda: False        # no system GeoIP, no download
+        eng_mod.resolve_country = lambda _host, hint="": ("", "")
+        eng_mod.resolve_state = lambda _host: ("", "", "")
+        eng = RotatingProxy(proxies=["192.0.2.20:8080", "198.51.100.4:1080"])
+        try:
+            eng.set_country("US")
+            check("a country cannot be chosen while nothing is known",
+                  False, "accepted without data")
+        except ValueError as exc:
+            check("a country cannot be chosen while nothing is known",
+                  True, str(exc))
+            check("the refusal names the missing data",
+                  "location data" in str(exc), str(exc))
+
+        # the database shows up: one pass, no rebuild, no restart
+        eng_mod.resolve_country = lambda host, hint="": (
+            ("US", "United States") if host == "192.0.2.20"
+            else ("DE", "Germany"))
+        eng_mod.resolve_state = lambda _host: ("Texas", "TX", "Houston")
+        geodb.available = lambda: True        # it just downloaded
+        changed = eng.regeolocate()
+        check("every row is resolved when the data lands",
+              changed == 2, str(changed))
+        check("a second pass changes nothing",
+              eng.regeolocate() == 0, str(eng.regeolocate()))
+        eng.set_country("US")
+        check("the scope now accepts the country",
+              eng.country == "US", eng.country)
+        eng.set_state("Texas")
+        check("and the state too",
+              eng.state == "Texas", eng.state)
+        scoped = eng._apply_scope(list(eng._nodes))
+        check("the scope keeps only the matching upstream",
+              [n.host for n in scoped[0]] == ["192.0.2.20"],
+              str([n.host for n in scoped[0]]))
+    finally:
+        eng_mod.resolve_country, eng_mod.resolve_state = real_c, real_s
+        geodb.available = real_avail
+
+
 def test_daily_rotation():
     """The daily rotation: a fresh pull replaces the whole pool, and a
     failed pull never empties it.
@@ -2369,6 +2497,8 @@ def main():
         test_header_hygiene,
         lambda: test_expect_continue(target_port, mock_port),
         test_list_refresh,
+        test_geo_country_fallback,
+        test_regeolocate,
         test_daily_rotation,
         lambda: test_pool_restock(mock_port, dead_port),
         test_lifecycle,

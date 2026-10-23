@@ -325,6 +325,10 @@ pick it. **Anywhere** in a box puts that level back.
   (`/usr/share/GeoIP/GeoIP.dat`, from `geoip-database` + `python3-geoip`),
   entirely offline and cached; if none is installed, a `HK`-style column in
   a pasted export is used instead, so TSV imports still work bare.
+  Where the system database does not exist — Windows, and most packaged
+  builds — the *state/city* database below answers country too (DB-IP City
+  Lite carries the country as well), so a fresh install needs only that one
+  download for every level of the picker to work.
 * **State** — needs the *state/city* database, which is **downloaded once**
   and then used offline, like the country one:
 
@@ -332,6 +336,11 @@ pick it. **Anywhere** in a box puts that level back.
   python3 run.py --geo-status    # where it stands, then exit
   python3 run.py --geo-fetch     # fetch it once (~120 MB)
   ```
+
+  A first run **downloads it automatically** when it is missing (logged as
+  `state/city database not installed -- downloading it…`, then
+  `locations resolved for N upstreams`), so a brand-new install — Windows
+  included — needs no setup step before the scope pickers work.
 
   The same two actions live in *Settings* (the **state/city database** row
   shows `installed · 121.1 MB · 2026-10-01` with a **Refresh** button that
@@ -394,10 +403,13 @@ exactly the exit you set. A saved scope whose country has left the pool is
 still displayed (`Germany (DE) · not in pool`) instead of silently claiming
 *Anywhere*.
 
-Missing the database? Install it and restart the panel:
+Missing the database? It downloads itself on the panel's first run, or
+fetch it by hand (and optionally install the system copy, which then takes
+priority as the country source):
 
 ```bash
-sudo apt install geoip-database python3-geoip
+python3 run.py --geo-fetch      # the bundled, cross-platform route
+sudo apt install geoip-database python3-geoip    # optional system copy
 ```
 
 ## Picking what the engine may use
@@ -641,7 +653,9 @@ full-width cards underneath.
   list-refresh URL(s)/interval behind the auto-restock feature and the
   rotation interval behind the daily pool turnover, the
   **state/city database** row (its size and build date, with **Refresh** to
-  download it once for state-level exit selection) and the **network (ASN)
+  download it once for state-level exit selection — a first run fetches it
+  on its own when it is missing, and country comes from the same file on
+  systems without a GeoIP install) and the **network (ASN)
   database** row beside it (same treatment, ~5 MB, the source of the
   hosting/VPN risk flags behind *Verify exits now*).
 * **Apps** — the three switches described above, with their live status and a
