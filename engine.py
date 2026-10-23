@@ -101,6 +101,10 @@ DEFAULTS = {
     # free proxies die constantly, so the pool restocks itself
     "refresh_url": ", ".join(REFRESH_SOURCES),
     "refresh_interval": 21600,   # seconds between list refreshes (6 h)
+    # daily rotation: every `rotation_interval` seconds the *whole* pool is
+    # swapped for a fresh pull -- yesterday's upstreams are dropped instead
+    # of lingering next to the new ones (see `rotate_list`)
+    "rotation_interval": 86400,  # seconds between full pool rotations (24 h)
 }
 
 MAX_HEADER_BYTES = 65536
@@ -109,6 +113,7 @@ BUFFER_CAP = 5000             # log lines kept in memory for the GUI
 STALE_AFTER = 10              # failed probes before an entry is dropped
 RESTOCK_FLOOR = 100           # thin enough to fetch fresh upstreams at once
 RESTOCK_COOLDOWN = 900        # seconds between automatic restocks
+RESTOCK_SHRINK = 0.8          # pool this fraction of its last size = refetch
 FAST_MS = 300.0               # latency at or below this counts as "fast"
 USE_FLAGS = ("http", "socks4", "socks5", "strong", "fast")  # routing scope
 
@@ -484,6 +489,24 @@ def _validate_refresh_interval(value) -> int:
             f"refresh interval must be a number of seconds, got {value!r}")
     if secs < 60:
         raise ValueError("refresh interval must be at least 60 seconds")
+    return secs
+
+
+def _validate_rotation_interval(value) -> int:
+    """Normalise `rotation_interval` (seconds) or raise ValueError.
+
+    A rotation replaces the entire pool, so it gets the same 60 s floor as
+    a plain refresh -- there is no "off" value: pointing `refresh_url` at
+    nothing switches the whole family of pulls (refresh, restock and
+    rotation) off together.
+    """
+    try:
+        secs = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"rotation interval must be a number of seconds, got {value!r}")
+    if secs < 60:
+        raise ValueError("rotation interval must be at least 60 seconds")
     return secs
 
 
@@ -1128,6 +1151,11 @@ class RotatingProxy:
         except ValueError:
             self.settings["refresh_interval"] = DEFAULTS["refresh_interval"]
         try:
+            self.settings["rotation_interval"] = _validate_rotation_interval(
+                self.settings.get("rotation_interval"))
+        except ValueError:
+            self.settings["rotation_interval"] = DEFAULTS["rotation_interval"]
+        try:
             self.settings["use_only"] = _validate_use_only(
                 self.settings.get("use_only"))
         except ValueError:
@@ -1147,6 +1175,7 @@ class RotatingProxy:
         self._srv: socket.socket | None = None
         self._threads: list[threading.Thread] = []
         self._refresh_thread: threading.Thread | None = None
+        self._rotation_thread: threading.Thread | None = None
         self._open_socks: set[socket.socket] = set()
 
         self.stats = {
@@ -1160,7 +1189,10 @@ class RotatingProxy:
             "started_at": 0.0,
             "last_check_at": 0.0,
             "last_refresh_at": 0.0,
+            "last_rotation_at": 0.0,           # when the pool was last swapped
             "pool_at_refresh": 0,              # pool size at that moment
+            "pool_at_restock": 0,              # pool size at the last pull
+            "pool_at_rotation": 0,             # pool size after that swap
             "check_progress": (0, 0),
         }
 
@@ -1197,8 +1229,8 @@ class RotatingProxy:
             updates = dict(updates)
             updates["rotate_on"] = _validate_rotate_on(updates["rotate_on"])
         if ("refresh_url" in updates or "refresh_interval" in updates
-                or "use_only" in updates or "region" in updates
-                or "state" in updates):
+                or "rotation_interval" in updates or "use_only" in updates
+                or "region" in updates or "state" in updates):
             updates = dict(updates)
             if "refresh_url" in updates:
                 updates["refresh_url"] = _validate_refresh_url(
@@ -1206,6 +1238,9 @@ class RotatingProxy:
             if "refresh_interval" in updates:
                 updates["refresh_interval"] = _validate_refresh_interval(
                     updates["refresh_interval"])
+            if "rotation_interval" in updates:
+                updates["rotation_interval"] = _validate_rotation_interval(
+                    updates["rotation_interval"])
             if "use_only" in updates:
                 updates["use_only"] = _validate_use_only(
                     updates["use_only"])
@@ -1610,6 +1645,7 @@ class RotatingProxy:
             self.check_now(reason="startup")
         self.start_health_loop()
         self.start_refresh_loop()
+        self.start_rotation_loop()
 
     def stop(self) -> None:
         if not self.running and self.stats["status"] != "starting":
@@ -1798,7 +1834,36 @@ class RotatingProxy:
             node.last_error = reason
             node.last_check = time.time()
             node.sample(0.0)
+            # a failure seen while serving real traffic is proof enough:
+            # once the counter crosses STALE_AFTER the entry leaves the
+            # pool right here, rather than lingering as a dead row until
+            # the next health sweep gets around to pruning it
+            stale = (node.failures >= STALE_AFTER
+                     and any(n is node for n in self._nodes))
         self.log("warn", f"evicted {node.label} ({reason})")
+        if stale:
+            self._prune_now()
+
+    def _prune_now(self) -> int:
+        """Drop stale entries immediately and top the pool back up.
+
+        Called from live traffic (`_note_failure`) so a proxy that has
+        plainly stopped working disappears the moment it fails for the
+        `STALE_AFTER`-th time in a row, without waiting for the next
+        sweep.  Whatever is dropped counts towards the restock rules, so
+        deletions and new arrivals keep pace with each other.
+        """
+        pruned = self._prune_stale()
+        if not pruned:
+            return 0
+        with self._lock:
+            left = len(self._nodes)
+        self.log("info", f"dropped {pruned} dead upstream"
+                         f"{'' if pruned == 1 else 's'} that failed "
+                         f"{STALE_AFTER} times in a row "
+                         f"({left} left in the pool)")
+        self._maybe_restock()
+        return pruned
 
     def _note_success(self, node: Node, latency_ms: float | None = None) -> None:
         with self._lock:
@@ -2532,23 +2597,22 @@ class RotatingProxy:
                         f" · HTTPS-only: none of these {total} can tunnel")
             self.log("info", msg)
             # free proxies die between refreshes, so the pool is cleaned
-            # after every sweep instead of at the next interval, and topped
-            # up right away when dropping them left it thin
-            pruned = self._prune_stale()
-            if pruned:
-                with self._lock:
-                    left = len(self._nodes)
-                self.log("info", f"dropped {pruned} dead upstream"
-                                 f"{'' if pruned == 1 else 's'} that failed "
-                                 f"{STALE_AFTER} times in a row "
-                                 f"({left} left in the pool)")
-                self._maybe_restock()
+            # after every sweep instead of at the next interval -- and a
+            # proxy that keeps failing also disappears the moment live
+            # traffic fails through it (see `_note_failure`)
+            self._prune_now()
         except Exception as exc:
             self.log("error", f"health check failed: {exc}")
         finally:
             with self._lock:
                 self.stats["check_progress"] = (0, 0)
             self._checking.clear()
+            # every sweep also looks for fresh upstreams: pruning thins
+            # the pool, and topping it back up is what keeps its size
+            # from settling at whatever the dead ones left behind.  Runs
+            # after the flag is down, so a restock's health check of the
+            # arrivals is not swallowed by this sweep.
+            self._maybe_restock()
 
     def _probe_wrapped(self, node: Node):
         return self.probe(node)
@@ -2641,22 +2705,21 @@ class RotatingProxy:
 
         threading.Thread(target=work, name="restock", daemon=True).start()
 
-    def refresh_list(self, *, reason: str = "interval") -> tuple[int, int]:
-        """Fetch the configured lists and merge whatever is new.
+    def _pull_lists(self) -> tuple[list[str], int]:
+        """Fetch every configured list and parse it into upstream labels.
 
-        Returns ``(added, total)``.  Fetch failures are logged, never
-        raised: a list source going away must not take the proxy down or
-        kill the refresh loop.  Long-dead entries are pruned in the same
-        pass so the pool neither stagnates nor grows without bound.  When
-        the engine is running, new upstreams are health-checked straight
-        away so they can serve instead of sitting "unverified" until the
-        next interval sweep.
+        Returns ``(labels, unreachable)``: the protocol-aware labels in
+        first-seen order -- the `…/socks5.txt` of a URL is what marks its
+        bare rows as SOCKS5 -- plus how many sources could not be reached.
+        Fetch failures are logged, never raised: a list source going away
+        must not take the proxy down or kill whichever loop called this.
+        Shared by the merging refresh (`refresh_list`) and the full swap
+        (`rotate_list`), so both always see exactly the same lists.
         """
         urls = self.refresh_url
-        if not urls:
-            with self._lock:
-                return 0, len(self._nodes)
-        blobs: list[str] = []
+        hints: list[tuple[str, str]] = []
+        out: list[str] = []
+        seen: set[str] = set()
         dead = 0
         for url in urls:
             try:
@@ -2678,8 +2741,36 @@ class RotatingProxy:
                 if "://" not in s and hint:
                     s = hint + s
                 lines.append(s)
-            blobs.append("\n".join(lines))
-        added = self.add_proxies("\n".join(blobs)) if blobs else 0
+            for label, cc in iter_proxy_entries("\n".join(lines)):
+                if label in seen:
+                    continue
+                seen.add(label)
+                out.append(label)
+                if cc:
+                    hints.append((label, cc))
+        with self._lock:
+            # a country code carried by a row survives without GeoIP, the
+            # same way `add_proxies` records it for a manual import
+            for label, cc in hints:
+                self._cc_hints.setdefault(label, cc)
+        return out, dead
+
+    def refresh_list(self, *, reason: str = "interval") -> tuple[int, int]:
+        """Fetch the configured lists and merge whatever is new.
+
+        Returns ``(added, total)``.  Fetch failures are logged, never
+        raised: a list source going away must not take the proxy down or
+        kill the refresh loop.  Long-dead entries are pruned in the same
+        pass so the pool neither stagnates nor grows without bound.  When
+        the engine is running, new upstreams are health-checked straight
+        away so they can serve instead of sitting "unverified" until the
+        next interval sweep.
+        """
+        if not self.refresh_url:
+            with self._lock:
+                return 0, len(self._nodes)
+        labels, dead = self._pull_lists()
+        added = self.add_proxies("\n".join(labels)) if labels else 0
         pruned = self._prune_stale()
         with self._lock:
             self.stats["last_refresh_at"] = time.time()
@@ -2693,12 +2784,62 @@ class RotatingProxy:
                              f"({total} configured)")
             if added and self.running:
                 self.check_now(reason="list refresh")
-        elif dead and dead == len(urls):
+        elif dead and dead == len(self.refresh_url):
             self.log("warn", "proxy list refresh: no source was reachable")
         else:
             self.log("info", f"proxy list refreshed ({reason}): "
                              "no new upstreams")
         return added, total
+
+    def rotate_list(self, *, reason: str = "daily") -> tuple[int, int]:
+        """Swap the *whole* pool for a fresh pull: older upstreams go, new arrive.
+
+        This is the rotation behind `rotation_interval` (24 h by default).
+        Free proxies die constantly, so instead of letting yesterday's
+        rows sit beside today's, every rotation throws the configured set
+        away and keeps only what the lists serve now.  An address that is
+        listed again simply earns its place again from scratch.
+
+        Returns ``(dropped, total)``: how many configured upstreams left,
+        and the pool size after the swap.  A pull that comes back empty
+        -- every source unreachable, or nothing parseable in what they
+        served -- leaves the pool exactly as it was and says why: a
+        network hiccup must not take the proxy offline until tomorrow.
+        """
+        if not self.refresh_url:
+            with self._lock:
+                return 0, len(self._nodes)
+        labels, dead = self._pull_lists()
+        with self._lock:
+            old = {n.label for n in self._nodes}
+        if not labels:
+            with self._lock:
+                total = len(self._nodes)
+            why = ("no source was reachable" if dead
+                   and dead == len(self.refresh_url)
+                   else "the lists served no usable upstreams")
+            self.log("warn" if dead else "info",
+                     f"pool rotation skipped ({reason}): {why} — "
+                     f"{total} upstreams kept")
+            return 0, total
+        self.set_proxies(labels)
+        kept = sum(1 for label in labels if label in old)
+        dropped = len(old) - kept
+        with self._lock:
+            total = len(self._nodes)
+            now = time.time()
+            self.stats["last_rotation_at"] = now
+            # restock reads these two: a pool that was just swapped is
+            # stocked, so it must not be topped up again a minute later
+            self.stats["last_refresh_at"] = now
+            self.stats["pool_at_refresh"] = total
+            self.stats["pool_at_rotation"] = total
+        self.log("info", f"pool rotated ({reason}): {dropped} older upstream"
+                         f"{'' if dropped == 1 else 's'} dropped, "
+                         f"{total} in the pool now")
+        if self.running:
+            self.check_now(reason="rotation")
+        return dropped, total
 
     def _refresh_loop(self) -> None:
         while not self._stop.wait(
@@ -2720,6 +2861,41 @@ class RotatingProxy:
         t = threading.Thread(target=self._refresh_loop,
                              name="refresh-loop", daemon=True)
         self._refresh_thread = t            # so a stale loop can spot us
+        t.start()
+        self._threads.append(t)
+
+    def _rotate_loop(self) -> None:
+        """Swap the pool for a fresh pull every `rotation_interval` seconds.
+
+        One pass a day is the whole idea: pull whatever the lists serve
+        now and drop yesterday's upstreams with it.  The wait happens
+        first -- a freshly started engine keeps the pool it was given
+        until its first rotation is due.
+        """
+        while not self._stop.wait(
+                max(60, int(self.settings.get("rotation_interval")
+                            or DEFAULTS["rotation_interval"]))):
+            if threading.current_thread() is not self._rotation_thread:
+                return                      # a newer start replaced us
+            try:
+                self.rotate_list(reason="interval")
+            except Exception as exc:        # the thread must never die
+                self.log("error", f"pool rotation failed: {exc}")
+
+    def start_rotation_loop(self) -> None:
+        """Rotate the whole pool every `rotation_interval` seconds (24 h).
+
+        Shares the refresh sources: without a `refresh_url` there is
+        nothing to pull, so -- like the merging refresh loop -- it simply
+        does not start.
+        """
+        if not self.refresh_url:
+            return
+        if any(t.name == "rotate-loop" for t in self._threads):
+            return
+        t = threading.Thread(target=self._rotate_loop,
+                             name="rotate-loop", daemon=True)
+        self._rotation_thread = t           # so a stale loop can spot us
         t.start()
         self._threads.append(t)
 

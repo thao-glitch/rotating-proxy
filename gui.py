@@ -93,6 +93,7 @@ SETTINGS_SPEC = [
     ("rotate_on",      "Rotate exit on status",    "str"),
     ("refresh_url",    "Refresh list from URL(s)", "str"),
     ("refresh_interval", "Refresh list every (s)", "int"),
+    ("rotation_interval", "Rotate pool every (s)", "int"),
 ]
 
 # Real font specs -- Tk only honours a *single* name as a named font, so we
@@ -345,6 +346,8 @@ class ProxyGUI(tk.Tk):
         proxm.add_command(label="Verify exits now", command=self._verify_now)
         proxm.add_command(label="Refresh proxy list now",
                           command=self._refresh_list_now)
+        proxm.add_command(label="Rotate pool now (drop older, pull fresh)",
+                          command=self._rotate_now)
         proxm.add_command(label="Settings…", command=self._open_settings)
         proxm.add_separator()
         proxm.add_command(label="Point apps at this proxy…",
@@ -810,6 +813,30 @@ class ProxyGUI(tk.Tk):
                                 f"({total} configured)")
 
         self.status_var.set("Refreshing proxy list…")
+        self._run_async(work, on_done=done)
+
+    def _rotate_now(self):
+        """Swap the whole pool for a fresh pull right now (Proxy menu).
+
+        The daily rotation on demand: every configured upstream that the
+        new pull does not bring back is dropped, so the panel ends up with
+        today's list instead of yesterday's stacked under it.
+        """
+        if not self.engine.refresh_url:
+            self.status_var.set("No refresh URL set — add one in Settings "
+                                "first")
+            return
+        result: dict[str, tuple] = {}
+
+        def work():
+            result["pair"] = self.engine.rotate_list(reason="manual")
+
+        def done():
+            dropped, total = result.get("pair", (0, 0))
+            self.status_var.set(f"Pool rotated: {dropped} older dropped, "
+                                f"{total} configured")
+
+        self.status_var.set("Rotating proxy pool…")
         self._run_async(work, on_done=done)
 
     # -------------------------------------------------------------- pool UI

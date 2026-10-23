@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--refresh-interval", type=int,
                    default=DEFAULTS["refresh_interval"],
                    help="seconds between automatic proxy list refreshes")
+    p.add_argument("--rotation-interval", type=int,
+                   default=DEFAULTS["rotation_interval"],
+                   help="seconds between full pool rotations: each one drops "
+                        "the configured upstreams and keeps only a fresh pull "
+                        "(default: %(default)s = 24 h)")
     p.add_argument("--geo-fetch", action="store_true",
                    help="download the city/state database once (about 60 MB, "
                         "DB-IP City Lite, CC BY 4.0) and exit; every state "
@@ -499,7 +504,8 @@ def run_cli(args) -> int:
                     max_retries=args.max_retries,
                     rotate_on=args.rotate_on,
                     refresh_url=args.refresh_url,
-                    refresh_interval=args.refresh_interval)
+                    refresh_interval=args.refresh_interval,
+                    rotation_interval=args.rotation_interval)
     engine = RotatingProxy(proxies=args.proxy or list(PROXY_LIST), **settings)
     rank = {"debug": 0, "info": 1, "warn": 2, "error": 3}
     threshold = rank[args.log_level]
@@ -593,6 +599,7 @@ def run_gui(args) -> int:
                  "max_retries": args.max_retries,
                  "refresh_url": args.refresh_url,
                  "refresh_interval": args.refresh_interval,
+                 "rotation_interval": args.rotation_interval,
                  "use_only": args.use}
     for key, value in overrides.items():
         if value != DEFAULTS[key]:

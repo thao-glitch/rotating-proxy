@@ -25,6 +25,10 @@ in front of it.
   scrapers are merged every few hours, long-dead entries are dropped after
   each health sweep, and a pool that has thinned out refetches itself
   before it runs dry — *Proxy → Refresh proxy list now* does it immediately
+* **The pool turns over every day**: each `rotation_interval` (default 24 h)
+  throws the configured upstreams away and keeps only a fresh pull, so
+  yesterday's proxies never pile up under today's — *Proxy → Rotate pool
+  now* does it on the spot, and a pull that fails keeps the pool it had
 
 ```
 $ python3 run.py            # opens the desktop panel
@@ -154,6 +158,9 @@ export HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888
                        disables the refresh)
 --refresh-interval N   seconds between automatic list refreshes
                        (default 21600 = 6 h, minimum 60)
+--rotation-interval N  seconds between full pool rotations: each one drops
+                       every configured upstream and keeps only a fresh
+                       pull (default 86400 = 24 h, minimum 60)
 --log-level LEVEL      debug | info | warn | error   (--cli mode)
 --cli                  run headless, print the log
 --check                probe the whole pool once and exit
@@ -555,6 +562,16 @@ engine reloads fresh ones from plain-text lists **while it runs**:
   and health-checks the additions straight away. Each pass is logged:
   `proxy list refreshed (interval): +132 new, 18 stale dropped (731
   configured)`.
+* **Rotated daily** — every `rotation_interval` (default 24 hours) the
+  configured set is thrown away *whole* and replaced by whatever the lists
+  serve then, so a day's worth of dead rows never accumulates beside the
+  arrivals. The log says what went and what arrived:
+  `pool rotated (interval): 731 older upstreams dropped, 8200 in the pool
+  now`. A pull that comes back empty — every source unreachable, or nothing
+  parseable in what they served — leaves the pool exactly as it was and
+  logs `pool rotation skipped …`: a network hiccup must not take the proxy
+  offline until tomorrow. The restock rules above read the same moment, so
+  a just-rotated pool is never topped up a minute later.
 * **Built-in sources** — six lists from three independent scrapers ship as
   the default (`TheSpeedX` HTTP/SOCKS4/SOCKS5, `monosans` HTTP and SOCKS5 —
   checked before publishing — and `clarketm`'s raw HTTP list), so a fresh
@@ -578,8 +595,9 @@ engine reloads fresh ones from plain-text lists **while it runs**:
   fetch happens at once rather than at the end of the interval. A 15-minute
   cooldown and a single-flight guard keep a dead list source from turning
   into a request storm.
-* **Manual** — *Proxy → Refresh proxy list now* pulls immediately, without
-  waiting for the interval.
+* **Manual** — *Proxy → Refresh proxy list now* pulls and merges
+  immediately, without waiting for the interval; *Proxy → Rotate pool now*
+  pulls and swaps the whole pool on the spot.
 * **Failure-proof** — a source that is offline or gone is logged and
   retried next round; it never takes the proxy down or kills the refresh
   loop. Downloads are capped at 4 MB.
@@ -620,7 +638,8 @@ full-width cards underneath.
 * **Settings** — listen address, health-check interval, retries, timeouts,
   parallel probes, whether to also probe HTTPS tunnel support, the
   *Rotate exit on status* list behind the block-rotation feature, the
-  list-refresh URL(s)/interval behind the auto-restock feature, the
+  list-refresh URL(s)/interval behind the auto-restock feature and the
+  rotation interval behind the daily pool turnover, the
   **state/city database** row (its size and build date, with **Refresh** to
   download it once for state-level exit selection) and the **network (ASN)
   database** row beside it (same treatment, ~5 MB, the source of the

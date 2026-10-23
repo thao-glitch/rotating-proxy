@@ -473,6 +473,8 @@ def test_dialogs(app):
     check("settings lists the list-refresh options",
           "refresh_url" in spec_keys and "refresh_interval" in spec_keys,
           str(spec_keys))
+    check("settings lists the rotation interval",
+          "rotation_interval" in spec_keys, str(spec_keys))
 
     # ---- state/city database: status line + one-time download -----------
     check("geo status row present",
@@ -623,6 +625,10 @@ def test_every_button(app):
         check("Proxy/Refresh list fires",
               invoke("Proxy", "Refresh proxy list now"))
         check("refresh without a URL points at Settings",
+              "Settings" in app.status_var.get(), app.status_var.get())
+        check("Proxy/Rotate pool fires",
+              invoke("Proxy", "Rotate pool now (drop older, pull fresh)"))
+        check("rotate without a URL points at Settings",
               "Settings" in app.status_var.get(), app.status_var.get())
 
         check("Proxy/Point apps fires",

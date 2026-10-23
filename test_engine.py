@@ -1958,6 +1958,97 @@ def test_list_refresh():
         httpd.shutdown()
 
 
+def test_daily_rotation():
+    """The daily rotation: a fresh pull replaces the whole pool, and a
+    failed pull never empties it.
+
+    Free proxies die constantly, so once a day the engine throws the
+    configured set away and keeps only what the lists serve now -- without
+    that, yesterday's dead rows sit under today's arrivals forever.  What
+    it must never do is act on an empty answer: an unreachable source has
+    to leave the pool exactly as it was, or a network hiccup would take
+    the proxy offline until tomorrow's rotation.
+    """
+    print("\ndaily pool rotation")
+    import http.server
+
+    http_list = "192.0.2.10:8080\n192.0.2.11:3128\n192.0.2.12:3129\n"
+    socks_list = "203.0.113.50:1080\n203.0.113.51:1080\n"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = socks_list if "socks5" in self.path else http_list
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_a):               # keep the test output clean
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    logs: list = []
+    eng = RotatingProxy(logger=lambda l, m: logs.append((l, m)),
+                        proxies=["192.0.2.99:8080"])
+    try:
+        eng.configure(refresh_url=f"{base}/http.txt, {base}/socks5.txt",
+                      rotation_interval=3600)
+        dropped, total = eng.rotate_list(reason="test")
+        check("the older pool is dropped", dropped == 1, f"{dropped}")
+        check("only the fresh pull is left",
+              total == 5 and len(eng.proxies()) == 5,
+              f"{total} {eng.proxies()}")
+        check("192.0.2.99:8080 no longer configured",
+              "192.0.2.99:8080" not in eng.proxies(), str(eng.proxies()))
+        check("socks rows keep their scheme",
+              "socks5://203.0.113.50:1080" in eng.proxies(),
+              str(eng.proxies()))
+        check("rotation logged",
+              any("pool rotated" in m for _, m in logs), str(logs[-1:]))
+        check("snapshot records the rotation",
+              eng.snapshot()["last_rotation_at"] > 0)
+
+        # the same lists again: everything comes back, nothing is dropped
+        dropped2, total2 = eng.rotate_list(reason="test")
+        check("unchanged lists drop nothing",
+              dropped2 == 0 and total2 == 5, f"{dropped2}/{total2}")
+
+        # every source unreachable: keep the pool and say why
+        eng.configure(refresh_url="http://127.0.0.1:1/list.txt")
+        dropped3, total3 = eng.rotate_list(reason="test")
+        check("failed pull keeps the pool",
+              dropped3 == 0 and total3 == 5, f"{dropped3}/{total3}")
+        check("failed pull logged",
+              any("rotation skipped" in m for _, m in logs[-3:]),
+              str(logs[-2:]))
+
+        # validation surfaces as ValueError, not a broken setting
+        rejected = False
+        try:
+            eng.configure(rotation_interval=30)
+        except ValueError:
+            rejected = True
+        check("interval under 60s rejected", rejected)
+
+        # …and the loop refuses to start without sources
+        eng.configure(refresh_url="")
+        eng.start_rotation_loop()
+        check("loop refuses to start without a URL",
+              not any(t.name == "rotate-loop" for t in eng._threads))
+        eng.configure(refresh_url=f"{base}/http.txt")
+        eng.start_rotation_loop()
+        check("loop starts with a URL",
+              any(t.name == "rotate-loop" for t in eng._threads))
+        eng._stop.set()                          # releases the parked loop
+    finally:
+        eng._stop.set()
+        httpd.shutdown()
+
+
 def test_pool_restock(mock_port, dead_port):
     """Dead proxies are dropped after every sweep, and the pool tops up.
 
@@ -2278,6 +2369,7 @@ def main():
         test_header_hygiene,
         lambda: test_expect_continue(target_port, mock_port),
         test_list_refresh,
+        test_daily_rotation,
         lambda: test_pool_restock(mock_port, dead_port),
         test_lifecycle,
     ]
